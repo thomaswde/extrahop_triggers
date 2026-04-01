@@ -191,8 +191,8 @@ this interval only. The exceptions are noted below.
 | `l4_bytes_2` | integer | **Delta**      | L4 payload bytes from endpoint 2 since last tick.   |
 | `pkts_1`     | integer | **Delta**      | Packets from endpoint 1 since last tick.            |
 | `pkts_2`     | integer | **Delta**      | Packets from endpoint 2 since last tick.            |
-| `l2_bytes_1` | integer | **Cumulative** | L2 bytes (including Ethernet headers) from endpoint 1 since flow start. |
-| `l2_bytes_2` | integer | **Cumulative** | L2 bytes from endpoint 2 since flow start.          |
+| `l2_bytes_1` | integer | **Delta**      | L2 bytes (including Ethernet headers) from endpoint 1 since flow start. |
+| `l2_bytes_2` | integer | **Delta**      | L2 bytes from endpoint 2 since flow start.          |
 
 ### DSCP
 
@@ -318,12 +318,6 @@ Since most tick values are deltas, rates are computed directly:
 interval_sec = (tick[N].ts - tick[N-1].ts) / 1000
 pps  = tick[N].pkts_1 / interval_sec
 mbps = (tick[N].l4_bytes_1 * 8) / (interval_sec * 1_000_000)
-```
-
-For L2 bytes (cumulative), compute deltas first:
-
-```
-l2_delta = tick[N].l2_bytes_1 - tick[N-1].l2_bytes_1
 ```
 
 ### DSCP name resolution
