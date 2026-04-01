@@ -1,231 +1,277 @@
-# **TCP Flow Health Monitor**
+# TCP Flow Health Monitor — Message Schema
 
-**Export:** Kafka Open Data Stream (ODS), one object per message, one message per event  
-**Encoding:** JSON (one message per event)  
-**Topic:** Configured at trigger deployment
+**Trigger version:** 3.2.0
+**Transport:** Open Data Stream (ODS) — Kafka or HTTP
+**Encoding:** JSON (one message per event)
 
 ---
 
-## **Overview**
+## Overview
 
-This trigger emits per-flow TCP health telemetry from ExtraHop into Kafka. It is designed for monitoring peer-to-peer TCP connections (e.g. ISO 8583\) where both endpoints use static ports and the socket tuple is long-lived.
+This trigger emits per-flow TCP health telemetry from ExtraHop. It is designed
+for monitoring durable peer-to-peer TCP connections (e.g. ISO 8583) where both
+endpoints use static ports and the socket tuple is long-lived.
 
 Three distinct message types are emitted over the lifetime of a flow:
 
-| msg\_type | ExtraHop event | Fires | Purpose |
-| :---- | :---- | :---- | :---- |
-| `flow_open` | TCP\_OPEN | Once per flow | Birth certificate \- identity \+ handshake |
-| `flow_tick` | FLOW\_TICK | Per turn | 128 packets  | Periodic TCP health snapshot |
-| `flow_close` | TCP\_CLOSE | Once per flow | Death certificate \- termination status |
+| msg_type     | ExtraHop event | Fires                            | Purpose                                  |
+|--------------|----------------|----------------------------------|------------------------------------------|
+| `flow_open`  | TCP_OPEN       | Once per flow                    | Birth certificate — identity + handshake |
+| `flow_tick`  | FLOW_TICK      | Per turn or per 128 payload bytes | Periodic TCP health snapshot             |
+| `flow_close` | TCP_CLOSE      | Once per flow                    | Death certificate — termination status   |
 
-All messages share a common envelope (version, msg\_type, ts, flow\_id) and a consistent positional naming convention described below.
-
----
-
-## **Positional convention (\_1 / \_2)**
-
-All per-endpoint fields use a `_1` / `_2` suffix. These positions are assigned by the ExtraHop platform when the flow is created and **remain consistent for the entire lifetime of the flow id**. They do not necessarily imply client, server, source, or destination \- they are arbitrary but stable identifiers.
-
-The `flow_open` message establishes what each position represents by providing `ip_1`, `port_1`, `ip_2`, `port_2`. Downstream consumers should use these fields to build a lookup (e.g. "position 1 \= 10.1.2.3:8583, position 2 \= 10.4.5.6:8583") and apply business labels as needed.
-
-Every subsequent `flow_tick` and `flow_close` message for the same `flow_id` uses the same positional assignment. Counters ending in `_1` always refer to the same endpoint as `ip_1` from the open message.
+All messages share a common envelope (version, msg_type, ts, flow_id) and a
+consistent positional naming convention described below.
 
 ---
 
-## **Common envelope**
+## Positional convention (_1 / _2)
+
+All per-endpoint fields use a `_1` / `_2` suffix. These positions are assigned
+by the ExtraHop platform when the flow is created and **remain consistent for
+the entire lifetime of the flow**. They do not inherently imply client, server,
+source, or destination — they are arbitrary but stable identifiers.
+
+The `flow_open` message establishes what each position represents by providing
+`ip_1`, `port_1`, `ip_2`, `port_2`. Downstream consumers should use these
+fields to build a lookup (e.g. "position 1 = 10.1.2.3:8583, position 2 =
+10.4.5.6:8583") and apply business labels as needed.
+
+When the TCP 3-way handshake is observed, the `sender_is_1` field indicates
+which position corresponds to the connection initiator (the SYN sender). See
+the `flow_open` section for details.
+
+Every subsequent `flow_tick` and `flow_close` message for the same `flow_id`
+uses the same positional assignment. Counters ending in `_1` always refer to
+the same endpoint as `ip_1` from the open message.
+
+---
+
+## Common envelope
 
 Present in **every** message type.
 
-| Field | Type | Description |
-| :---- | :---- | :---- |
-| `version` | string | Trigger version (e.g. `"3.1.0"`). Use for schema compatibility. |
-| `msg_type` | string | One of `"flow_open"`, `"flow_tick"`, `"flow_close"`. |
-| `ts` | integer | Message emission time. Epoch milliseconds from `Date.now()`. |
-| `flow_id` | string | ExtraHop-assigned unique flow identifier. Stable across all events for a given TCP connection. Join key. |
+| Field      | Type    | Description                                                        |
+|------------|---------|--------------------------------------------------------------------|
+| `version`  | string  | Trigger version (e.g. `"3.2.0"`). Use for schema compatibility.   |
+| `msg_type` | string  | One of `"flow_open"`, `"flow_tick"`, `"flow_close"`.               |
+| `ts`       | integer | Message emission time. Epoch milliseconds from `Date.now()`.       |
+| `flow_id`  | string  | ExtraHop-assigned unique flow identifier. Stable across all events for a given TCP connection. Join key. |
 
 ---
 
-## **flow\_open**
+## flow_open
 
-Emitted **once** when the TCP 3-way handshake completes. Contains everything needed to identify the two endpoints and the parameters they negotiated at connection establishment.
+Emitted **once** when a TCP connection is initiated. This fires for all flows,
+including "loose initiations" where the 3-way handshake was not observed
+(e.g. the flow was already in progress when ExtraHop began monitoring).
 
-### **Identity**
+When the handshake is observed, the message includes negotiated TCP parameters
+and authoritative sender identification. For loose initiations, handshake-
+dependent values are null.
 
-| Field | Type | Description |
-| :---- | :---- | :---- |
-| `ip_1` | string|null | IPv4 or IPv6 address of endpoint 1\. String representation. |
-| `port_1` | integer | TCP port of endpoint 1\. |
-| `mac_1` | string|null | MAC address of endpoint 1 (colon-separated). Null if the device is not discovered or is a gateway. |
-| `ip_2` | string|null | IPv4 or IPv6 address of endpoint 2\. |
-| `port_2` | integer | TCP port of endpoint 2\. |
-| `mac_2` | string|null | MAC address of endpoint 2\. |
+### Identity
 
-### **Network context**
+| Field    | Type         | Description                                                   |
+|----------|--------------|---------------------------------------------------------------|
+| `ip_1`   | string\|null | IPv4 or IPv6 address of endpoint 1. String representation.    |
+| `port_1` | integer      | TCP port of endpoint 1.                                       |
+| `mac_1`  | string\|null | MAC address of endpoint 1 (colon-separated). Null if the device is not discovered or is a gateway. |
+| `ip_2`   | string\|null | IPv4 or IPv6 address of endpoint 2.                           |
+| `port_2` | integer      | TCP port of endpoint 2.                                       |
+| `mac_2`  | string\|null | MAC address of endpoint 2.                                    |
 
-| Field | Type | Description |
-| :---- | :---- | :---- |
-| `ip_proto` | string|null | IP protocol name (e.g. `"TCP"`). |
-| `ip_version` | string|null | IP version (e.g. `"IPv4"`, `"IPv6"`). |
-| `vlan` | integer | 802.1Q VLAN ID. `0` if untagged or unavailable. |
+### Sender identification
 
-### **TCP handshake parameters**
+| Field         | Type          | Description                                                |
+|---------------|---------------|------------------------------------------------------------|
+| `sender_is_1` | boolean\|null | Indicates which endpoint initiated the TCP connection (sent the SYN). `true` = endpoint 1 is the sender. `false` = endpoint 2 is the sender. `null` = loose initiation, sender is unknown. When null, the handshake was not observed and the platform cannot authoritatively determine which side initiated. |
 
-| Field | Type | Treatment | Description |
-| :---- | :---- | :---- | :---- |
-| `handshake_ms` | number|null | Point-in-time | Time to complete the 3-way handshake, in milliseconds. Null if handshake was not observed (mid-stream pickup). |
-| `window_scale_1` | integer|null | Point-in-time | TCP window scale factor negotiated by endpoint 1 (from TCP option kind 3). Null if not present in SYN/SYN-ACK. |
-| `window_scale_2` | integer|null | Point-in-time | TCP window scale factor negotiated by endpoint 2\. |
-| `init_rcv_wnd_1` | integer|null | Point-in-time | Initial TCP receive window size advertised by endpoint 1 during the handshake, in bytes. |
-| `init_rcv_wnd_2` | integer|null | Point-in-time | Initial TCP receive window size advertised by endpoint 2\. |
+### Network context
 
-### **Fingerprints**
+| Field        | Type         | Description                                                  |
+|--------------|--------------|--------------------------------------------------------------|
+| `ip_proto`   | string\|null | IP protocol name (e.g. `"TCP"`).                             |
+| `ip_version` | string\|null | IP version (e.g. `"IPv4"`, `"IPv6"`).                        |
+| `vlan`       | integer      | 802.1Q VLAN ID. `0` if untagged or unavailable.              |
 
-| Field | Type | Treatment | Description |
-| :---- | :---- | :---- | :---- |
-| `ja4t_1` | string|null | Point-in-time | JA4T fingerprint for endpoint 1 (the TCP client's SYN). Encodes window size, TCP options, MSS, and window scale. |
-| `ja4t_2` | string|null | Point-in-time | JA4TS fingerprint for endpoint 2 (the TCP server's SYN-ACK). |
+### TCP handshake parameters
+
+These fields are null on loose initiations (when `sender_is_1` is null).
+
+| Field            | Type          | Description                                                 |
+|------------------|---------------|-------------------------------------------------------------|
+| `handshake_ms`   | number\|null  | Time to complete the 3-way handshake, in milliseconds.      |
+| `window_scale_1` | integer\|null | TCP window scale factor negotiated by endpoint 1 (from TCP option kind 3). Null if not present in SYN/SYN-ACK. |
+| `window_scale_2` | integer\|null | TCP window scale factor negotiated by endpoint 2.           |
+| `init_rcv_wnd_1` | integer\|null | Initial TCP receive window size advertised by endpoint 1 during the handshake, in bytes. |
+| `init_rcv_wnd_2` | integer\|null | Initial TCP receive window size advertised by endpoint 2.   |
+
+### Fingerprints
+
+These fields are null on loose initiations.
+
+| Field    | Type         | Description                                               |
+|----------|--------------|-----------------------------------------------------------|
+| `ja4t_1` | string\|null | JA4T fingerprint for endpoint 1 (from the SYN). Encodes window size, TCP options, MSS, and window scale. |
+| `ja4t_2` | string\|null | JA4TS fingerprint for endpoint 2 (from the SYN-ACK).     |
 
 ---
 
-## **flow\_tick**
+## flow_tick
 
-Emitted on **every flow turn or 128 packets**, whichever comes first, on active flows. This is the primary health monitoring message. Contains latency, retransmission, and throughput counters.
+Emitted on each **flow turn** (a complete request-response exchange) or after
+**128 bytes of payload** in one direction, whichever comes first. For ISO 8583
+traffic with short messages, ticks typically fire on turns. Tick intervals are
+**not** fixed-period — they are transaction-driven and variable in duration.
 
-### **Important: cumulative vs. per-interval semantics**
+### Value semantics
 
-Most counters in this message are **cumulative since flow start**, not deltas since the last tick. The warehouse must compute deltas between successive ticks to derive per-interval values.
+Most values are **deltas since the last tick** — they represent activity in
+this interval only. The exceptions are noted below.
 
-**The one exception** is `rtt_ms`, which is a per-interval median \- it represents the median RTT observed *since the last FLOW\_TICK fired*, not a running lifetime value.
+| Treatment          | Applies to                                                    |
+|--------------------|---------------------------------------------------------------|
+| **Delta**          | retrans_bytes, rto, zero_wnd, rcv_wnd_throttle, nagle_delay, l4_bytes, pkts, frag_pkts, overlap_segments |
+| **Per-interval**   | rtt_ms (median for this interval, not a delta or cumulative)  |
+| **Cumulative**     | l2_bytes_1, l2_bytes_2 (cumulative since flow start)          |
+| **Last-observed**  | dscp_1, dscp_2 (most recent value, not a count)               |
+| **Point-in-time**  | flow_age (current age of the flow at the time of this tick)   |
 
-### **Identity echo**
+### Identity echo
 
-| Field | Type | Description |
-| ----- | ----- | ----- |
-| `ip_1` | string|null | Same as flow\_open. Echoed for standalone processing. |
-| `port_1` | integer | Same as flow\_open. |
-| `ip_2` | string|null | Same as flow\_open. |
-| `port_2` | integer | Same as flow\_open. |
+| Field    | Type         | Description                                          |
+|----------|--------------|------------------------------------------------------|
+| `ip_1`   | string\|null | Same as flow_open. Echoed for standalone processing. |
+| `port_1` | integer      | Same as flow_open.                                   |
+| `ip_2`   | string\|null | Same as flow_open.                                   |
+| `port_2` | integer      | Same as flow_open.                                   |
 
-### **Flow timing**
+### Flow timing
 
-| Field | Type | Treatment | Description |
-| ----- | ----- | ----- | ----- |
-| `flow_age` | number | Point-in-time | Time elapsed since the flow was initiated, in seconds. |
+| Field      | Type   | Description                                            |
+|------------|--------|--------------------------------------------------------|
+| `flow_age` | number | Time elapsed since the flow was initiated, in seconds. |
 
-### **Latency**
+### Latency
 
-| Field | Type | Treatment | Description |
-| ----- | ----- | ----- | ----- |
-| `rtt_ms` | number|null | **Per-interval** | Median TCP round-trip time observed since the last tick, in milliseconds. Computed from ACK timing. `null` when no RTT samples exist in the interval (e.g. idle flow). **This is NOT cumulative.** |
+| Field    | Type         | Description                                             |
+|----------|--------------|---------------------------------------------------------|
+| `rtt_ms` | number\|null | Median TCP round-trip time observed since the last tick, in milliseconds. Computed from ACK timing. `null` when no RTT samples exist in the interval (e.g. idle flow). |
 
-### **Retransmission**
+### Retransmission
 
-| Field | Type | Treatment | Description |
-| ----- | ----- | ----- | ----- |
-| `retrans_bytes_1` | integer | **Cumulative** | Total bytes retransmitted by endpoint 1 since flow start. Compute `delta = tick_N - tick_N-1` for per-interval retransmission volume. |
-| `retrans_bytes_2` | integer | **Cumulative** | Total bytes retransmitted by endpoint 2 since flow start. |
-| `rto_1` | integer | **Cumulative** | Count of retransmission timeout events for endpoint 1 since flow start. An RTO indicates the sender's retransmit timer expired without receiving an ACK. |
-| `rto_2` | integer | **Cumulative** | Count of retransmission timeout events for endpoint 2\. |
+| Field             | Type    | Description                                          |
+|-------------------|---------|------------------------------------------------------|
+| `retrans_bytes_1` | integer | Bytes retransmitted by endpoint 1 since last tick.   |
+| `retrans_bytes_2` | integer | Bytes retransmitted by endpoint 2 since last tick.   |
+| `rto_1`           | integer | Retransmission timeout events for endpoint 1 since last tick. An RTO indicates the sender's retransmit timer expired without receiving an ACK. |
+| `rto_2`           | integer | Retransmission timeout events for endpoint 2 since last tick. |
 
-### **Window health**
+### Window health
 
-| Field | Type | Treatment | Description |
-| ----- | ----- | ----- | ----- |
-| `zero_wnd_1` | integer | **Cumulative** | Count of TCP zero-window advertisements sent by endpoint 1 since flow start. Indicates the receiver's buffer is full and it is asking the sender to stop transmitting. |
-| `zero_wnd_2` | integer | **Cumulative** | Count of zero-window advertisements from endpoint 2\. |
-| `rcv_wnd_throttle_1` | integer | **Cumulative** | Count of receive-window throttle events for endpoint 1 since flow start. Indicates the receive window shrank enough to throttle the sender. |
-| `rcv_wnd_throttle_2` | integer | **Cumulative** | Receive-window throttles for endpoint 2\. |
+| Field                | Type    | Description                                     |
+|----------------------|---------|-------------------------------------------------|
+| `zero_wnd_1`         | integer | Zero-window advertisements sent by endpoint 1 since last tick. Indicates the receiver's buffer is full. |
+| `zero_wnd_2`         | integer | Zero-window advertisements from endpoint 2 since last tick. |
+| `rcv_wnd_throttle_1` | integer | Receive-window throttle events for endpoint 1 since last tick. Indicates the receive window shrank enough to throttle the sender. |
+| `rcv_wnd_throttle_2` | integer | Receive-window throttles for endpoint 2 since last tick. |
 
-### **Nagle**
+### Nagle
 
-| Field | Type | Treatment | Description |
-| ----- | ----- | ----- | ----- |
-| `nagle_delay_1` | integer | **Cumulative** | Count of Nagle-algorithm-induced delays for endpoint 1 since flow start. Nagle delays occur when the TCP stack holds a small segment to coalesce it with subsequent data. |
-| `nagle_delay_2` | integer | **Cumulative** | Nagle delays for endpoint 2\. |
+| Field           | Type    | Description                                       |
+|-----------------|---------|---------------------------------------------------|
+| `nagle_delay_1` | integer | Nagle-algorithm-induced delays for endpoint 1 since last tick. |
+| `nagle_delay_2` | integer | Nagle delays for endpoint 2 since last tick.      |
 
-### **Throughput counters**
+### Throughput
 
-All throughput counters are **cumulative since flow start**. To compute per-interval rates:
-
-```
-delta_bytes = tick_N.l4_bytes_1 - tick_N_minus_1.l4_bytes_1
-interval_ms = tick_N.ts - tick_N_minus_1.ts
-mbps        = (delta_bytes * 8) / (interval_ms * 1000)
-pps         = (tick_N.pkts_1 - tick_N_minus_1.pkts_1) / (interval_ms / 1000)
-```
-
-| Field | Type | Treatment | Description |
-| ----- | ----- | ----- | ----- |
-| `l4_bytes_1` | integer | **Cumulative** | L4 payload bytes transmitted by endpoint 1 since flow start. Excludes L2/L3 headers. |
-| `l4_bytes_2` | integer | **Cumulative** | L4 payload bytes from endpoint 2\. |
+| Field        | Type    | Treatment      | Description                                         |
+|--------------|---------|----------------|-----------------------------------------------------|
+| `l4_bytes_1` | integer | **Delta**      | L4 payload bytes from endpoint 1 since last tick.   |
+| `l4_bytes_2` | integer | **Delta**      | L4 payload bytes from endpoint 2 since last tick.   |
+| `pkts_1`     | integer | **Delta**      | Packets from endpoint 1 since last tick.            |
+| `pkts_2`     | integer | **Delta**      | Packets from endpoint 2 since last tick.            |
 | `l2_bytes_1` | integer | **Cumulative** | L2 bytes (including Ethernet headers) from endpoint 1 since flow start. |
-| `l2_bytes_2` | integer | **Cumulative** | L2 bytes from endpoint 2\. |
-| `pkts_1` | integer | **Cumulative** | Packet count from endpoint 1 since flow start. |
-| `pkts_2` | integer | **Cumulative** | Packet count from endpoint 2\. |
+| `l2_bytes_2` | integer | **Cumulative** | L2 bytes from endpoint 2 since flow start.          |
 
-### **DSCP**
+### DSCP
 
-| Field | Type | Treatment | Description |
-| ----- | ----- | ----- | ----- |
-| `dscp_1` | integer | **Last-observed** | The most recent DSCP numeric value in packets from endpoint 1\. Not cumulative \- this is the last value seen, not a count. See RFC 2474 for code-to-name mapping. Common values: 0=Best Effort, 46=EF, 34=AF41. |
-| `dscp_2` | integer | **Last-observed** | Most recent DSCP value from endpoint 2\. |
+| Field    | Type    | Description                                             |
+|----------|---------|--------------------------------------------------------|
+| `dscp_1` | integer | Most recent DSCP numeric value in packets from endpoint 1. Not a count — this is the last value seen. See the DSCP reference table in the warehouse guidance section. |
+| `dscp_2` | integer | Most recent DSCP value from endpoint 2.                 |
 
-### **IP fragmentation and TCP overlap**
+### IP fragmentation and TCP overlap
 
-| Field | Type | Treatment | Description |
-| ----- | ----- | ----- | ----- |
-| `frag_pkts_1` | integer | **Cumulative** | Count of IP-fragmented packets from endpoint 1 since flow start. |
-| `frag_pkts_2` | integer | **Cumulative** | Fragmented packets from endpoint 2\. |
-| `overlap_segments_1` | integer | **Cumulative** | Count of non-identical overlapping TCP segments from endpoint 1 since flow start. Two or more segments contained data for the same byte range. May indicate retransmission anomalies or injection. |
-| `overlap_segments_2` | integer | **Cumulative** | Overlapping segments from endpoint 2\. |
+| Field                | Type    | Description                                     |
+|----------------------|---------|-------------------------------------------------|
+| `frag_pkts_1`        | integer | IP-fragmented packets from endpoint 1 since last tick. |
+| `frag_pkts_2`        | integer | Fragmented packets from endpoint 2 since last tick. |
+| `overlap_segments_1` | integer | Non-identical overlapping TCP segments from endpoint 1 since last tick. Two or more segments contained data for the same byte range. |
+| `overlap_segments_2` | integer | Overlapping segments from endpoint 2 since last tick. |
 
 ---
 
-## **flow\_close**
+## flow_close
 
-Emitted **once** when the TCP connection terminates. Provides per-endpoint termination status. No inference required \- these booleans reflect the observed TCP state machine.
+Emitted **once** when the TCP connection terminates. Provides definitive
+per-endpoint termination status. No inference required — these booleans reflect
+the observed TCP state machine.
 
-### **Identity echo**
+### Terminology
 
-| Field | Type | Description |
-| :---- | :---- | :---- |
-| `ip_1` | string|null | Same as flow\_open. |
-| `port_1` | integer | Same as flow\_open. |
-| `ip_2` | string|null | Same as flow\_open. |
-| `port_2` | integer | Same as flow\_open. |
+| Term        | Meaning                                                           |
+|-------------|-------------------------------------------------------------------|
+| **shutdown** | This endpoint sent a TCP FIN, initiating a graceful close.       |
+| **reset**    | This endpoint sent a TCP RST after the flow was established.     |
+| **aborted**  | This endpoint sent a TCP RST before the flow was fully established. |
+| **expired**  | The flow timed out without any proper TCP termination.           |
 
-### **Flow timing**
+### Identity echo
 
-| Field | Type | Description |
-| :---- | :---- | :---- |
-| `flow_age` | number | Total duration of the flow from initiation to close, in seconds. |
+| Field    | Type         | Description                  |
+|----------|--------------|------------------------------|
+| `ip_1`   | string\|null | Same as flow_open.           |
+| `port_1` | integer      | Same as flow_open.           |
+| `ip_2`   | string\|null | Same as flow_open.           |
+| `port_2` | integer      | Same as flow_open.           |
 
-### **Termination status**
+### Flow timing
 
-| Field | Type | Description |
-| :---- | :---- | :---- |
-| `aborted_1` | boolean | `true` if endpoint 1 sent a TCP RST, terminating the connection abruptly. `false` for graceful close or expiry. |
-| `aborted_2` | boolean | `true` if endpoint 2 sent a TCP RST. |
-| `shutdown_1` | boolean | `true` if endpoint 1 initiated a graceful TCP shutdown (sent FIN). |
-| `shutdown_2` | boolean | `true` if endpoint 2 initiated a graceful TCP shutdown. |
-| `expired` | boolean | `true` if the flow timed out without any proper TCP termination (no FIN, no RST \- the ExtraHop platform expired the flow from its tracking table). |
+| Field      | Type   | Description                                                        |
+|------------|--------|--------------------------------------------------------------------|
+| `flow_age` | number | Total duration of the flow from initiation to close, in seconds.   |
 
-### **Interpreting termination**
+### Termination status
 
-| shutdown\_1 | shutdown\_2 | aborted\_1 | aborted\_2 | expired | Meaning |
-| :---- | :---- | :---- | :---- | :---- | :---- |
-| true | true | false | false | false | Normal graceful close (both sides sent FIN) |
-| true | false | false | false | false | Half-close: endpoint 1 sent FIN, endpoint 2 has not yet |
-| false | false | true | false | false | Endpoint 1 reset the connection |
-| false | false | false | true | false | Endpoint 2 reset the connection |
-| false | false | true | true | false | Both sides sent RST (rare) |
-| false | false | false | false | true | Connection expired without termination |
+| Field        | Type    | Description                                                          |
+|--------------|---------|----------------------------------------------------------------------|
+| `shutdown_1` | boolean | `true` if endpoint 1 sent a TCP FIN (graceful close).                |
+| `shutdown_2` | boolean | `true` if endpoint 2 sent a TCP FIN.                                 |
+| `reset_1`    | boolean | `true` if endpoint 1 sent a TCP RST after the connection was established. |
+| `reset_2`    | boolean | `true` if endpoint 2 sent a TCP RST after establishment.            |
+| `aborted_1`  | boolean | `true` if endpoint 1 sent a TCP RST before the connection was fully established. |
+| `aborted_2`  | boolean | `true` if endpoint 2 sent a TCP RST before establishment.           |
+| `expired`    | boolean | `true` if the flow timed out without any proper TCP termination (no FIN, no RST). |
+
+### Interpreting termination
+
+| shutdown | reset | aborted | expired | Meaning                                          |
+|----------|-------|---------|---------|--------------------------------------------------|
+| 1: T, 2: T | 1: F, 2: F | 1: F, 2: F | F | Normal graceful close (both sides sent FIN)      |
+| 1: T, 2: F | 1: F, 2: F | 1: F, 2: F | F | Half-close: endpoint 1 sent FIN, endpoint 2 has not |
+| 1: F, 2: F | 1: T, 2: F | 1: F, 2: F | F | Endpoint 1 reset the established connection      |
+| 1: F, 2: F | 1: F, 2: T | 1: F, 2: F | F | Endpoint 2 reset the established connection      |
+| 1: T, 2: F | 1: F, 2: T | 1: F, 2: F | F | Endpoint 1 sent FIN, endpoint 2 sent RST during shutdown |
+| 1: F, 2: F | 1: F, 2: F | 1: T, 2: F | F | Endpoint 1 aborted before establishment          |
+| 1: F, 2: F | 1: F, 2: F | 1: F, 2: F | T | Connection expired without termination           |
 
 ---
 
-## **Warehouse guidance**
+## Warehouse guidance
 
-### **Joining flow lifecycle**
+### Joining flow lifecycle
 
 All three message types share `flow_id`. A complete flow record is:
 
@@ -233,68 +279,98 @@ All three message types share `flow_id`. A complete flow record is:
 SELECT
     o.flow_id,
     o.ip_1, o.port_1, o.ip_2, o.port_2,
+    o.sender_is_1,
     o.handshake_ms,
     t.*,
-    c.aborted_1, c.aborted_2, c.shutdown_1, c.shutdown_2, c.expired
+    c.shutdown_1, c.shutdown_2,
+    c.reset_1, c.reset_2,
+    c.aborted_1, c.aborted_2,
+    c.expired
 FROM flow_open  o
 JOIN flow_tick  t ON t.flow_id = o.flow_id
 JOIN flow_close c ON c.flow_id = o.flow_id
 ```
 
-### **Computing per-interval deltas**
+### Using sender_is_1
 
-For any cumulative field, the per-interval value is:
+To label endpoints as sender/receiver:
 
+```sql
+SELECT
+    flow_id,
+    CASE WHEN o.sender_is_1 = true  THEN o.ip_1 ELSE o.ip_2 END AS sender_ip,
+    CASE WHEN o.sender_is_1 = true  THEN o.ip_2 ELSE o.ip_1 END AS receiver_ip,
+    CASE WHEN o.sender_is_1 = true  THEN t.retrans_bytes_1 ELSE t.retrans_bytes_2 END AS sender_retrans,
+    CASE WHEN o.sender_is_1 = true  THEN t.retrans_bytes_2 ELSE t.retrans_bytes_1 END AS receiver_retrans
+FROM flow_open o
+JOIN flow_tick t ON t.flow_id = o.flow_id
+WHERE o.sender_is_1 IS NOT NULL
 ```
-delta = tick[N].field - tick[N-1].field
-```
 
-where `tick[N-1]` is the previous tick for the same `flow_id`, ordered by `ts`.
+Flows where `sender_is_1` is null (loose initiations) cannot be authoritatively
+oriented. Query them using `_1`/`_2` directly, or filter them out if sender
+attribution is required.
 
-For the **first tick** after a flow opens, there is no prior tick. Use the value as-is (it represents the cumulative total since flow start, which for a 30-second-old flow is effectively the first interval).
+### Computing rates
 
-### **Computing rates (PPS, Mbps)**
+Since most tick values are deltas, rates are computed directly:
 
 ```
 interval_sec = (tick[N].ts - tick[N-1].ts) / 1000
-pps  = (tick[N].pkts_1 - tick[N-1].pkts_1) / interval_sec
-mbps = ((tick[N].l4_bytes_1 - tick[N-1].l4_bytes_1) * 8) / (interval_sec * 1_000_000)
+pps  = tick[N].pkts_1 / interval_sec
+mbps = (tick[N].l4_bytes_1 * 8) / (interval_sec * 1_000_000)
 ```
 
-### **DSCP name resolution**
+For L2 bytes (cumulative), compute deltas first:
+
+```
+l2_delta = tick[N].l2_bytes_1 - tick[N-1].l2_bytes_1
+```
+
+### DSCP name resolution
 
 The trigger emits numeric DSCP values. Standard mappings:
 
-| Value | Name | Value | Name | Value | Name |
-| ----- | ----- | ----- | ----- | ----- | ----- |
-| 0 | BE | 26 | AF31 | 40 | CS5 |
-| 8 | CS1 | 28 | AF32 | 44 | VA |
-| 10 | AF11 | 30 | AF33 | 46 | EF |
-| 12 | AF12 | 32 | CS4 | 48 | CS6 |
-| 14 | AF13 | 34 | AF41 | 56 | CS7 |
-| 16 | CS2 | 36 | AF42 |  |  |
-| 18 | AF21 | 38 | AF43 |  |  |
-| 20 | AF22 |  |  |  |  |
-| 22 | AF23 |  |  |  |  |
-| 24 | CS3 |  |  |  |  |
+| Value | Name   | Value | Name  | Value | Name  |
+|-------|--------|-------|-------|-------|-------|
+| 0     | BE     | 26    | AF31  | 40    | CS5   |
+| 8     | CS1    | 28    | AF32  | 44    | VA    |
+| 10    | AF11   | 30    | AF33  | 46    | EF    |
+| 12    | AF12   | 32    | CS4   | 48    | CS6   |
+| 14    | AF13   | 34    | AF41  | 56    | CS7   |
+| 16    | CS2    | 36    | AF42  |       |       |
+| 18    | AF21   | 38    | AF43  |       |       |
+| 20    | AF22   |       |       |       |       |
+| 22    | AF23   |       |       |       |       |
+| 24    | CS3    |       |       |       |       |
 
-### **Handling late-start flows**
+### Identifying loose initiations
 
-If the trigger is assigned to a device after a TCP connection is already established, the `flow_open` message will not exist for that flow. The first message will be a `flow_tick`. In this case:
+A flow_open message with `sender_is_1: null` is a loose initiation. The
+handshake was not observed, so:
 
-* `window_scale`, `init_rcv_wnd`, `handshake_ms`, and `ja4t` are unavailable  
-* All cumulative counters start from whatever values they had at the time the trigger first fired, not from true zero  
-* The identity (`ip_1`, `port_1`, etc.) is still established via late-initialization
+- `handshake_ms`, `window_scale_*`, `init_rcv_wnd_*`, `ja4t_*` are all null
+- Sender/receiver attribution is unavailable
+- The first flow_tick values may not represent a complete interval
+
+### Handling null values
+
+| Scenario                  | Fields affected                          | Reason                                     |
+|---------------------------|------------------------------------------|--------------------------------------------|
+| Loose initiation          | `sender_is_1`, handshake fields = null   | 3WHS not observed                          |
+| No RTT samples            | `rtt_ms` = null                          | Idle flow or no ACK-based samples          |
+| No window scale in SYN    | `window_scale_1/2` = null                | Endpoint did not include TCP option kind 3 |
+| Gateway/undiscovered device | `mac_1/2` = null                       | Device not in ExtraHop discovery table     |
 
 ---
 
-## **Sample messages**
+## Sample messages
 
-### **flow\_open**
+### flow_open (3WHS observed)
 
 ```json
 {
-  "version": "3.1.0",
+  "version": "3.2.0",
   "msg_type": "flow_open",
   "ts": 1711900800000,
   "flow_id": "FMak3xB7hMC",
@@ -304,6 +380,7 @@ If the trigger is assigned to a device after a TCP connection is already establi
   "ip_2": "10.4.5.6",
   "port_2": 8583,
   "mac_2": "00:6f:7e:8d:9c:ab",
+  "sender_is_1": true,
   "ip_proto": "TCP",
   "ip_version": "IPv4",
   "vlan": 100,
@@ -317,11 +394,39 @@ If the trigger is assigned to a device after a TCP connection is already establi
 }
 ```
 
-### **flow\_tick**
+### flow_open (loose initiation)
 
 ```json
 {
-  "version": "3.1.0",
+  "version": "3.2.0",
+  "msg_type": "flow_open",
+  "ts": 1711900800000,
+  "flow_id": "GNbl4yC8iND",
+  "ip_1": "10.1.2.3",
+  "port_1": 8583,
+  "mac_1": "00:1a:2b:3c:4d:5e",
+  "ip_2": "10.4.5.6",
+  "port_2": 8583,
+  "mac_2": "00:6f:7e:8d:9c:ab",
+  "sender_is_1": null,
+  "ip_proto": "TCP",
+  "ip_version": "IPv4",
+  "vlan": 100,
+  "handshake_ms": null,
+  "window_scale_1": null,
+  "window_scale_2": null,
+  "init_rcv_wnd_1": null,
+  "init_rcv_wnd_2": null,
+  "ja4t_1": null,
+  "ja4t_2": null
+}
+```
+
+### flow_tick
+
+```json
+{
+  "version": "3.2.0",
   "msg_type": "flow_tick",
   "ts": 1711900830000,
   "flow_id": "FMak3xB7hMC",
@@ -343,10 +448,10 @@ If the trigger is assigned to a device after a TCP connection is already establi
   "nagle_delay_2": 0,
   "l4_bytes_1": 52400,
   "l4_bytes_2": 48200,
-  "l2_bytes_1": 54800,
-  "l2_bytes_2": 50600,
   "pkts_1": 380,
   "pkts_2": 350,
+  "l2_bytes_1": 54800,
+  "l2_bytes_2": 50600,
   "dscp_1": 46,
   "dscp_2": 46,
   "frag_pkts_1": 0,
@@ -356,11 +461,11 @@ If the trigger is assigned to a device after a TCP connection is already establi
 }
 ```
 
-### **flow\_close**
+### flow_close
 
 ```json
 {
-  "version": "3.1.0",
+  "version": "3.2.0",
   "msg_type": "flow_close",
   "ts": 1711987200000,
   "flow_id": "FMak3xB7hMC",
@@ -369,11 +474,12 @@ If the trigger is assigned to a device after a TCP connection is already establi
   "port_1": 8583,
   "ip_2": "10.4.5.6",
   "port_2": 8583,
-  "aborted_1": false,
-  "aborted_2": false,
   "shutdown_1": true,
   "shutdown_2": true,
+  "reset_1": false,
+  "reset_2": false,
+  "aborted_1": false,
+  "aborted_2": false,
   "expired": false
 }
 ```
-
