@@ -132,9 +132,8 @@ this interval only. The exceptions are noted below.
 
 | Treatment          | Applies to                                                    |
 |--------------------|---------------------------------------------------------------|
-| **Delta**          | retrans_bytes, rto, zero_wnd, rcv_wnd_throttle, nagle_delay, l4_bytes, pkts, frag_pkts, overlap_segments |
+| **Delta**          | retrans_bytes, rto, zero_wnd, rcv_wnd_throttle, nagle_delay, l4_bytes, pkts, frag_pkts, overlap_segments, l2_bytes_1, l2_bytes_2 |
 | **Per-interval**   | rtt_ms (median for this interval, not a delta or cumulative)  |
-| **Cumulative**     | l2_bytes_1, l2_bytes_2 (cumulative since flow start)          |
 | **Last-observed**  | dscp_1, dscp_2 (most recent value, not a count)               |
 | **Point-in-time**  | flow_age (current age of the flow at the time of this tick)   |
 
