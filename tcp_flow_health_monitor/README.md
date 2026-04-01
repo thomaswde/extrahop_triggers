@@ -1,7 +1,7 @@
-# TCP Flow Health Monitor — Message Schema
+# TCP Flow Health Monitor - Message Schema
 
 **Trigger version:** 3.2.0
-**Transport:** Open Data Stream (ODS) — Kafka or HTTP
+**Transport:** Open Data Stream (ODS) - Kafka or HTTP
 **Encoding:** JSON (one message per event)
 
 ---
@@ -16,9 +16,9 @@ Three distinct message types are emitted over the lifetime of a flow:
 
 | msg_type     | ExtraHop event | Fires                            | Purpose                                  |
 |--------------|----------------|----------------------------------|------------------------------------------|
-| `flow_open`  | TCP_OPEN       | Once per flow                    | Birth certificate — identity + handshake |
+| `flow_open`  | TCP_OPEN       | Once per flow                    | Birth certificate - identity + handshake |
 | `flow_tick`  | FLOW_TICK      | Per turn or per 128 payload bytes | Periodic TCP health snapshot             |
-| `flow_close` | TCP_CLOSE      | Once per flow                    | Death certificate — termination status   |
+| `flow_close` | TCP_CLOSE      | Once per flow                    | Death certificate - termination status   |
 
 All messages share a common envelope (version, msg_type, ts, flow_id) and a
 consistent positional naming convention described below.
@@ -30,7 +30,7 @@ consistent positional naming convention described below.
 All per-endpoint fields use a `_1` / `_2` suffix. These positions are assigned
 by the ExtraHop platform when the flow is created and **remain consistent for
 the entire lifetime of the flow**. They do not inherently imply client, server,
-source, or destination — they are arbitrary but stable identifiers.
+source, or destination - they are arbitrary but stable identifiers.
 
 The `flow_open` message establishes what each position represents by providing
 `ip_1`, `port_1`, `ip_2`, `port_2`. Downstream consumers should use these
@@ -123,11 +123,11 @@ These fields are null on loose initiations.
 Emitted on each **flow turn** (a complete request-response exchange) or after
 **128 bytes of payload** in one direction, whichever comes first. For ISO 8583
 traffic with short messages, ticks typically fire on turns. Tick intervals are
-**not** fixed-period — they are transaction-driven and variable in duration.
+**not** fixed-period - they are transaction-driven and variable in duration.
 
 ### Value semantics
 
-Most values are **deltas since the last tick** — they represent activity in
+Most values are **deltas since the last tick** - they represent activity in
 this interval only. The exceptions are noted below.
 
 | Treatment          | Applies to                                                    |
@@ -198,7 +198,7 @@ this interval only. The exceptions are noted below.
 
 | Field    | Type    | Description                                             |
 |----------|---------|--------------------------------------------------------|
-| `dscp_1` | integer | Most recent DSCP numeric value in packets from endpoint 1. Not a count — this is the last value seen. See the DSCP reference table in the warehouse guidance section. |
+| `dscp_1` | integer | Most recent DSCP numeric value in packets from endpoint 1. Not a count - this is the last value seen. See the DSCP reference table in the warehouse guidance section. |
 | `dscp_2` | integer | Most recent DSCP value from endpoint 2.                 |
 
 ### IP fragmentation and TCP overlap
@@ -215,7 +215,7 @@ this interval only. The exceptions are noted below.
 ## flow_close
 
 Emitted **once** when the TCP connection terminates. Provides definitive
-per-endpoint termination status. No inference required — these booleans reflect
+per-endpoint termination status. No inference required - these booleans reflect
 the observed TCP state machine.
 
 ### Terminology
