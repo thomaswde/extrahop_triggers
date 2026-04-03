@@ -173,10 +173,11 @@ if (event === "FLOW_TICK") {
         flow_age: Flow.age,
 
         // Identity echo
-        ip_1:   id.ip_1,
-        port_1: id.port_1,
-        ip_2:   id.ip_2,
-        port_2: id.port_2,
+        ip_1:        id.ip_1,
+        port_1:      id.port_1,
+        ip_2:        id.ip_2,
+        port_2:      id.port_2,
+        sender_is_1: id.sender_is_1,
 
         // Latency — median RTT for this tick interval; null when no samples
         rtt_ms: (rtt === rtt) ? rtt : null,
@@ -263,10 +264,11 @@ if (event === "TCP_CLOSE") {
         flow_age: Flow.age,
 
         // Identity echo
-        ip_1:   id.ip_1,
-        port_1: id.port_1,
-        ip_2:   id.ip_2,
-        port_2: id.port_2,
+        ip_1:        id.ip_1,
+        port_1:      id.port_1,
+        ip_2:        id.ip_2,
+        port_2:      id.port_2,
+        sender_is_1: id.sender_is_1,
 
         // Graceful shutdown — this endpoint sent FIN
         shutdown_1: clientIs1 ? clientShutdown : serverShutdown,
