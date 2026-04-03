@@ -1,6 +1,4 @@
 
-`tcp_flow_health_monitor/TCP Flow Health Monitor (bundle).json`
-```json
 {
     ".meta": {
         "comment": "Emit per-flow TCP health metrics to Kafka for data warehouse  ingestion. Designed for durable peer-to-peer socket monitoring (e.g. ISO 8583) where both endpoints use static ports.",
