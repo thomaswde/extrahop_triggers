@@ -1,6 +1,6 @@
 # TCP Flow Health Monitor - Message Schema
 
-**Trigger version:** 3.2.0
+**Trigger version:** 3.2.1
 **Transport:** Open Data Stream (ODS) - Kafka or HTTP
 **Encoding:** JSON (one message per event)
 
