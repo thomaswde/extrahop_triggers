@@ -38,8 +38,10 @@ fields to build a lookup (e.g. "position 1 = 10.1.2.3:8583, position 2 =
 10.4.5.6:8583") and apply business labels as needed.
 
 When the TCP 3-way handshake is observed, the `sender_is_1` field indicates
-which position corresponds to the connection initiator (the SYN sender). See
-the `flow_open` section for details.
+which position corresponds to the connection initiator (the SYN sender). That
+value is stored in `Flow.store.identity` and echoed in every subsequent
+`flow_tick` and `flow_close` message for the same `flow_id`. For loose
+initiations, `sender_is_1` is null.
 
 Every subsequent `flow_tick` and `flow_close` message for the same `flow_id`
 uses the same positional assignment. Counters ending in `_1` always refer to
@@ -139,12 +141,13 @@ this interval only. The exceptions are noted below.
 
 ### Identity echo
 
-| Field    | Type         | Description                                          |
-|----------|--------------|------------------------------------------------------|
-| `ip_1`   | string\|null | Same as flow_open. Echoed for standalone processing. |
-| `port_1` | integer      | Same as flow_open.                                   |
-| `ip_2`   | string\|null | Same as flow_open.                                   |
-| `port_2` | integer      | Same as flow_open.                                   |
+| Field         | Type          | Description                                          |
+|---------------|---------------|------------------------------------------------------|
+| `ip_1`        | string\|null  | Same as flow_open. Echoed for standalone processing. |
+| `port_1`      | integer       | Same as flow_open.                                   |
+| `ip_2`        | string\|null  | Same as flow_open.                                   |
+| `port_2`      | integer       | Same as flow_open.                                   |
+| `sender_is_1` | boolean\|null | Echo of the sender identity established at flow_open. `true` = endpoint 1 initiated the connection, `false` = endpoint 2 initiated, `null` = sender unknown due to loose initiation. |
 
 ### Flow timing
 
@@ -229,12 +232,13 @@ the observed TCP state machine.
 
 ### Identity echo
 
-| Field    | Type         | Description                  |
-|----------|--------------|------------------------------|
-| `ip_1`   | string\|null | Same as flow_open.           |
-| `port_1` | integer      | Same as flow_open.           |
-| `ip_2`   | string\|null | Same as flow_open.           |
-| `port_2` | integer      | Same as flow_open.           |
+| Field         | Type          | Description                  |
+|---------------|---------------|------------------------------|
+| `ip_1`        | string\|null  | Same as flow_open.           |
+| `port_1`      | integer       | Same as flow_open.           |
+| `ip_2`        | string\|null  | Same as flow_open.           |
+| `port_2`      | integer       | Same as flow_open.           |
+| `sender_is_1` | boolean\|null | Echo of the sender identity established at flow_open. `true` = endpoint 1 initiated the connection, `false` = endpoint 2 initiated, `null` = sender unknown due to loose initiation. |
 
 ### Flow timing
 
@@ -288,191 +292,3 @@ SELECT
 FROM flow_open  o
 JOIN flow_tick  t ON t.flow_id = o.flow_id
 JOIN flow_close c ON c.flow_id = o.flow_id
-```
-
-### Using sender_is_1
-
-To label endpoints as sender/receiver:
-
-```sql
-SELECT
-    flow_id,
-    CASE WHEN o.sender_is_1 = true  THEN o.ip_1 ELSE o.ip_2 END AS sender_ip,
-    CASE WHEN o.sender_is_1 = true  THEN o.ip_2 ELSE o.ip_1 END AS receiver_ip,
-    CASE WHEN o.sender_is_1 = true  THEN t.retrans_bytes_1 ELSE t.retrans_bytes_2 END AS sender_retrans,
-    CASE WHEN o.sender_is_1 = true  THEN t.retrans_bytes_2 ELSE t.retrans_bytes_1 END AS receiver_retrans
-FROM flow_open o
-JOIN flow_tick t ON t.flow_id = o.flow_id
-WHERE o.sender_is_1 IS NOT NULL
-```
-
-Flows where `sender_is_1` is null (loose initiations) cannot be authoritatively
-oriented. Query them using `_1`/`_2` directly, or filter them out if sender
-attribution is required.
-
-### Computing rates
-
-Since most tick values are deltas, rates are computed directly:
-
-```
-interval_sec = (tick[N].ts - tick[N-1].ts) / 1000
-pps  = tick[N].pkts_1 / interval_sec
-mbps = (tick[N].l4_bytes_1 * 8) / (interval_sec * 1_000_000)
-```
-
-### DSCP name resolution
-
-The trigger emits numeric DSCP values. Standard mappings:
-
-| Value | Name   | Value | Name  | Value | Name  |
-|-------|--------|-------|-------|-------|-------|
-| 0     | BE     | 26    | AF31  | 40    | CS5   |
-| 8     | CS1    | 28    | AF32  | 44    | VA    |
-| 10    | AF11   | 30    | AF33  | 46    | EF    |
-| 12    | AF12   | 32    | CS4   | 48    | CS6   |
-| 14    | AF13   | 34    | AF41  | 56    | CS7   |
-| 16    | CS2    | 36    | AF42  |       |       |
-| 18    | AF21   | 38    | AF43  |       |       |
-| 20    | AF22   |       |       |       |       |
-| 22    | AF23   |       |       |       |       |
-| 24    | CS3    |       |       |       |       |
-
-### Identifying loose initiations
-
-A flow_open message with `sender_is_1: null` is a loose initiation. The
-handshake was not observed, so:
-
-- `handshake_ms`, `window_scale_*`, `init_rcv_wnd_*`, `ja4t_*` are all null
-- Sender/receiver attribution is unavailable
-- The first flow_tick values may not represent a complete interval
-
-### Handling null values
-
-| Scenario                  | Fields affected                          | Reason                                     |
-|---------------------------|------------------------------------------|--------------------------------------------|
-| Loose initiation          | `sender_is_1`, handshake fields = null   | 3WHS not observed                          |
-| No RTT samples            | `rtt_ms` = null                          | Idle flow or no ACK-based samples          |
-| No window scale in SYN    | `window_scale_1/2` = null                | Endpoint did not include TCP option kind 3 |
-| Gateway/undiscovered device | `mac_1/2` = null                       | Device not in ExtraHop discovery table     |
-
----
-
-## Sample messages
-
-### flow_open (3WHS observed)
-
-```json
-{
-  "version": "3.2.0",
-  "msg_type": "flow_open",
-  "ts": 1711900800000,
-  "flow_id": "FMak3xB7hMC",
-  "ip_1": "10.1.2.3",
-  "port_1": 8583,
-  "mac_1": "00:1a:2b:3c:4d:5e",
-  "ip_2": "10.4.5.6",
-  "port_2": 8583,
-  "mac_2": "00:6f:7e:8d:9c:ab",
-  "sender_is_1": true,
-  "ip_proto": "TCP",
-  "ip_version": "IPv4",
-  "vlan": 100,
-  "handshake_ms": 1.23,
-  "window_scale_1": 7,
-  "window_scale_2": 7,
-  "init_rcv_wnd_1": 65535,
-  "init_rcv_wnd_2": 65535,
-  "ja4t_1": "1024_2_1460_8_1-2-4-8-3:7",
-  "ja4t_2": "65535_2_1460_7_1-2-4-8-3:7"
-}
-```
-
-### flow_open (loose initiation)
-
-```json
-{
-  "version": "3.2.0",
-  "msg_type": "flow_open",
-  "ts": 1711900800000,
-  "flow_id": "GNbl4yC8iND",
-  "ip_1": "10.1.2.3",
-  "port_1": 8583,
-  "mac_1": "00:1a:2b:3c:4d:5e",
-  "ip_2": "10.4.5.6",
-  "port_2": 8583,
-  "mac_2": "00:6f:7e:8d:9c:ab",
-  "sender_is_1": null,
-  "ip_proto": "TCP",
-  "ip_version": "IPv4",
-  "vlan": 100,
-  "handshake_ms": null,
-  "window_scale_1": null,
-  "window_scale_2": null,
-  "init_rcv_wnd_1": null,
-  "init_rcv_wnd_2": null,
-  "ja4t_1": null,
-  "ja4t_2": null
-}
-```
-
-### flow_tick
-
-```json
-{
-  "version": "3.2.0",
-  "msg_type": "flow_tick",
-  "ts": 1711900830000,
-  "flow_id": "FMak3xB7hMC",
-  "flow_age": 30.1,
-  "ip_1": "10.1.2.3",
-  "port_1": 8583,
-  "ip_2": "10.4.5.6",
-  "port_2": 8583,
-  "rtt_ms": 2.45,
-  "retrans_bytes_1": 0,
-  "retrans_bytes_2": 1480,
-  "rto_1": 0,
-  "rto_2": 1,
-  "zero_wnd_1": 0,
-  "zero_wnd_2": 0,
-  "rcv_wnd_throttle_1": 0,
-  "rcv_wnd_throttle_2": 0,
-  "nagle_delay_1": 0,
-  "nagle_delay_2": 0,
-  "l4_bytes_1": 52400,
-  "l4_bytes_2": 48200,
-  "pkts_1": 380,
-  "pkts_2": 350,
-  "l2_bytes_1": 54800,
-  "l2_bytes_2": 50600,
-  "dscp_1": 46,
-  "dscp_2": 46,
-  "frag_pkts_1": 0,
-  "frag_pkts_2": 0,
-  "overlap_segments_1": 0,
-  "overlap_segments_2": 0
-}
-```
-
-### flow_close
-
-```json
-{
-  "version": "3.2.0",
-  "msg_type": "flow_close",
-  "ts": 1711987200000,
-  "flow_id": "FMak3xB7hMC",
-  "flow_age": 86400.5,
-  "ip_1": "10.1.2.3",
-  "port_1": 8583,
-  "ip_2": "10.4.5.6",
-  "port_2": 8583,
-  "shutdown_1": true,
-  "shutdown_2": true,
-  "reset_1": false,
-  "reset_2": false,
-  "aborted_1": false,
-  "aborted_2": false,
-  "expired": false
-}
-```
