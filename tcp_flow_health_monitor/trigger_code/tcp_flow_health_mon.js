@@ -36,7 +36,7 @@
 
 var KAFKA_TARGET  = "";            // ODS target name configured in ExtraHop admin
 var KAFKA_TOPIC = "";              // Kafka topic for flow health message
-var VERSION = "3.2.0";             // Schema version for warehouse
+var VERSION = "3.2.1";             // Schema version for warehouse
 
 // ========================= TCP_OPEN =========================================
 // Fires once per flow when a TCP connection is initiated. If the 3-way
