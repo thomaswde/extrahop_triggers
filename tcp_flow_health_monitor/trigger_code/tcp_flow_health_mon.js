@@ -1,6 +1,6 @@
 // ============================================================================
 // Title:   TCP Flow Health Monitor
-// Version: 3.2.1
+// Version: 3.3.0
 // Events:  TCP_OPEN, FLOW_TICK, TCP_CLOSE
 //
 // Purpose: Emit per-flow TCP health metrics via ODS for data warehouse
@@ -25,18 +25,23 @@
 //          The warehouse receives typed messages and owns all labeling,
 //          rate calculations, and DSCP name resolution.
 //
+// Rate:    FLOW_TICK deltas are accumulated in Flow.store and emitted at
+//          most once per EMIT_INTERVAL_MS (default 10 s). TCP_CLOSE flushes
+//          any remaining accumulated data before the close message.
+//
 // Output:  JSON messages via ODS:
 //            - flow_open:  Peer identity + TCP handshake parameters
-//            - flow_tick:  Periodic TCP health snapshot (per turn or 128 bytes)
+//            - flow_tick:  Aggregated TCP health snapshot (per emit interval)
 //            - flow_close: Connection termination status
 // ============================================================================
 
 
 // ========================= Configuration ====================================
 
-var KAFKA_TARGET  = "";            // ODS target name configured in ExtraHop admin
-var KAFKA_TOPIC = "";              // Kafka topic for flow health message
-var VERSION = "3.2.1";             // Schema version for warehouse
+var KAFKA_TARGET     = "";         // ODS target name configured in ExtraHop admin
+var KAFKA_TOPIC      = "";         // Kafka topic for flow health messages
+var VERSION          = "3.3.0";    // Schema version for warehouse
+var EMIT_INTERVAL_MS = 10000;      // Min ms between flow_tick emissions (10 s)
 
 // ========================= TCP_OPEN =========================================
 // Fires once per flow when a TCP connection is initiated. If the 3-way
@@ -138,11 +143,16 @@ if (event === "TCP_OPEN") {
 
 
 // ========================= FLOW_TICK ========================================
-// Fires on each flow turn (a complete request-response exchange) or after
-// 128 bytes of payload in one direction, whichever comes first.
+// Fires on each flow turn or after 128 bytes of payload, whichever is first.
 //
-// Counter values are deltas since the last FLOW_TICK.
-// RTT is the median observed since the last tick.
+// To reduce Kafka message volume, deltas from each tick are accumulated in
+// Flow.store.accum and only emitted when EMIT_INTERVAL_MS has elapsed since
+// the last send. TCP_CLOSE flushes any remaining accumulated data.
+//
+// Counter values from the platform are deltas since the last FLOW_TICK.
+// RTT is the median observed since the last tick — we keep the last non-null
+// value seen across the accumulation window.
+// DSCP is last-observed — we keep the latest value.
 // ============================================================================
 
 if (event === "FLOW_TICK") {
@@ -162,13 +172,67 @@ if (event === "FLOW_TICK") {
         Flow.store.identity = id;
     }
 
-    // RTT — NaN when no ACK samples exist in this interval
+    // Initialize the accumulator on first tick
+    var a = Flow.store.accum;
+    if (!a) {
+        a = {
+            retrans_bytes_1: 0, retrans_bytes_2: 0,
+            rto_1: 0,           rto_2: 0,
+            zero_wnd_1: 0,      zero_wnd_2: 0,
+            rcv_wnd_throttle_1: 0, rcv_wnd_throttle_2: 0,
+            nagle_delay_1: 0,   nagle_delay_2: 0,
+            l4_bytes_1: 0,      l4_bytes_2: 0,
+            pkts_1: 0,          pkts_2: 0,
+            l2_bytes_1: 0,      l2_bytes_2: 0,
+            frag_pkts_1: 0,     frag_pkts_2: 0,
+            overlap_segments_1: 0, overlap_segments_2: 0,
+            rtt_ms: null,
+            dscp_1: 0,          dscp_2: 0
+        };
+        Flow.store.accum = a;
+    }
+    if (!Flow.store.lastEmitTs) {
+        Flow.store.lastEmitTs = Date.now();
+    }
+
+    // Accumulate delta fields (sum across ticks)
+    a.retrans_bytes_1    += TCP.retransBytes1;
+    a.retrans_bytes_2    += TCP.retransBytes2;
+    a.rto_1              += Flow.rto1;
+    a.rto_2              += Flow.rto2;
+    a.zero_wnd_1         += TCP.zeroWnd1;
+    a.zero_wnd_2         += TCP.zeroWnd2;
+    a.rcv_wnd_throttle_1 += Flow.rcvWndThrottle1;
+    a.rcv_wnd_throttle_2 += Flow.rcvWndThrottle2;
+    a.nagle_delay_1      += Flow.nagleDelay1;
+    a.nagle_delay_2      += Flow.nagleDelay2;
+    a.l4_bytes_1         += Flow.bytes1;
+    a.l4_bytes_2         += Flow.bytes2;
+    a.pkts_1             += Flow.pkts1;
+    a.pkts_2             += Flow.pkts2;
+    a.l2_bytes_1         += Flow.l2Bytes1;
+    a.l2_bytes_2         += Flow.l2Bytes2;
+    a.frag_pkts_1        += Flow.fragPkts1;
+    a.frag_pkts_2        += Flow.fragPkts2;
+    a.overlap_segments_1 += Flow.overlapSegments1;
+    a.overlap_segments_2 += Flow.overlapSegments2;
+
+    // RTT: keep the last non-null median seen in this window
     var rtt = Flow.roundTripTime;
+    if (rtt === rtt) { a.rtt_ms = rtt; }   // NaN !== NaN, so this filters NaN
+
+    // DSCP: last-observed, just overwrite
+    a.dscp_1 = Flow.dscp1;
+    a.dscp_2 = Flow.dscp2;
+
+    // Emit only when the interval has elapsed
+    var now = Date.now();
+    if ((now - Flow.store.lastEmitTs) < EMIT_INTERVAL_MS) { return; }
 
     var message = {
         version:  VERSION,
         msg_type: "flow_tick",
-        ts:       Date.now(),
+        ts:       now,
         flow_id:  Flow.id,
         flow_age: Flow.age,
 
@@ -179,57 +243,48 @@ if (event === "FLOW_TICK") {
         port_2:      id.port_2,
         sender_is_1: id.sender_is_1,
 
-        // Latency — median RTT for this tick interval; null when no samples
-        rtt_ms: (rtt === rtt) ? rtt : null,
+        // Latency — last observed RTT in this window; null if none
+        rtt_ms: a.rtt_ms,
 
-        // Retransmission bytes
-        retrans_bytes_1: TCP.retransBytes1,
-        retrans_bytes_2: TCP.retransBytes2,
-
-        // Retransmission timeouts
-        rto_1: Flow.rto1,
-        rto_2: Flow.rto2,
-
-        // Zero windows
-        zero_wnd_1: TCP.zeroWnd1,
-        zero_wnd_2: TCP.zeroWnd2,
-
-        // Receive window throttles
-        rcv_wnd_throttle_1: Flow.rcvWndThrottle1,
-        rcv_wnd_throttle_2: Flow.rcvWndThrottle2,
-
-        // Nagle delays
-        nagle_delay_1: Flow.nagleDelay1,
-        nagle_delay_2: Flow.nagleDelay2,
-
-        // Throughput — bytes and packets
-        l4_bytes_1: Flow.bytes1,
-        l4_bytes_2: Flow.bytes2,
-        pkts_1:     Flow.pkts1,
-        pkts_2:     Flow.pkts2,
-
-        // L2 bytes
-        l2_bytes_1: Flow.l2Bytes1,
-        l2_bytes_2: Flow.l2Bytes2,
-
-        // DSCP (last observed numeric value per direction)
-        dscp_1: Flow.dscp1,
-        dscp_2: Flow.dscp2,
-
-        // Fragment and overlap indicators
-        frag_pkts_1:        Flow.fragPkts1,
-        frag_pkts_2:        Flow.fragPkts2,
-        overlap_segments_1: Flow.overlapSegments1,
-        overlap_segments_2: Flow.overlapSegments2
+        // Accumulated deltas for this emission window
+        retrans_bytes_1:    a.retrans_bytes_1,
+        retrans_bytes_2:    a.retrans_bytes_2,
+        rto_1:              a.rto_1,
+        rto_2:              a.rto_2,
+        zero_wnd_1:         a.zero_wnd_1,
+        zero_wnd_2:         a.zero_wnd_2,
+        rcv_wnd_throttle_1: a.rcv_wnd_throttle_1,
+        rcv_wnd_throttle_2: a.rcv_wnd_throttle_2,
+        nagle_delay_1:      a.nagle_delay_1,
+        nagle_delay_2:      a.nagle_delay_2,
+        l4_bytes_1:         a.l4_bytes_1,
+        l4_bytes_2:         a.l4_bytes_2,
+        pkts_1:             a.pkts_1,
+        pkts_2:             a.pkts_2,
+        l2_bytes_1:         a.l2_bytes_1,
+        l2_bytes_2:         a.l2_bytes_2,
+        dscp_1:             a.dscp_1,
+        dscp_2:             a.dscp_2,
+        frag_pkts_1:        a.frag_pkts_1,
+        frag_pkts_2:        a.frag_pkts_2,
+        overlap_segments_1: a.overlap_segments_1,
+        overlap_segments_2: a.overlap_segments_2
     };
 
     Remote.Kafka(KAFKA_TARGET).send(KAFKA_TOPIC, JSON.stringify(message));
+
+    // Reset accumulator and timestamp
+    Flow.store.lastEmitTs = now;
+    Flow.store.accum = null;
 }
 
 
 // ========================= TCP_CLOSE ========================================
 // Fires once when the TCP connection terminates.
-// Provides definitive per-endpoint termination status.
+//
+// If there is unflushed data in Flow.store.accum (accumulated since the last
+// emitted tick), we flush it as a final flow_tick before emitting flow_close.
+// This ensures no delta data is lost for the tail of the flow.
 //
 // Terminology:
 //   shutdown = this endpoint sent a FIN (graceful close)
@@ -245,8 +300,52 @@ if (event === "TCP_CLOSE") {
     var clientPort = Flow.client.port;
     var clientIs1  = (clientPort === Flow.port1);
 
-    // If we never captured identity or saw a FLOW_TICK, do not emit a flow_close
+    // If we never captured identity or saw a FLOW_TICK, do not emit
     if (!id) { return; }
+
+    // Flush any remaining accumulated tick data
+    var a = Flow.store.accum;
+    if (a) {
+        var flushMsg = {
+            version:  VERSION,
+            msg_type: "flow_tick",
+            ts:       Date.now(),
+            flow_id:  Flow.id,
+            flow_age: Flow.age,
+
+            ip_1:        id.ip_1,
+            port_1:      id.port_1,
+            ip_2:        id.ip_2,
+            port_2:      id.port_2,
+            sender_is_1: id.sender_is_1,
+
+            rtt_ms:             a.rtt_ms,
+            retrans_bytes_1:    a.retrans_bytes_1,
+            retrans_bytes_2:    a.retrans_bytes_2,
+            rto_1:              a.rto_1,
+            rto_2:              a.rto_2,
+            zero_wnd_1:         a.zero_wnd_1,
+            zero_wnd_2:         a.zero_wnd_2,
+            rcv_wnd_throttle_1: a.rcv_wnd_throttle_1,
+            rcv_wnd_throttle_2: a.rcv_wnd_throttle_2,
+            nagle_delay_1:      a.nagle_delay_1,
+            nagle_delay_2:      a.nagle_delay_2,
+            l4_bytes_1:         a.l4_bytes_1,
+            l4_bytes_2:         a.l4_bytes_2,
+            pkts_1:             a.pkts_1,
+            pkts_2:             a.pkts_2,
+            l2_bytes_1:         a.l2_bytes_1,
+            l2_bytes_2:         a.l2_bytes_2,
+            dscp_1:             a.dscp_1,
+            dscp_2:             a.dscp_2,
+            frag_pkts_1:        a.frag_pkts_1,
+            frag_pkts_2:        a.frag_pkts_2,
+            overlap_segments_1: a.overlap_segments_1,
+            overlap_segments_2: a.overlap_segments_2
+        };
+        Remote.Kafka(KAFKA_TARGET).send(KAFKA_TOPIC, JSON.stringify(flushMsg));
+        Flow.store.accum = null;
+    }
 
     // Read role-based termination booleans
     var clientShutdown = Flow.client.isShutdown || false;
