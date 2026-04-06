@@ -1,8 +1,8 @@
 # TCP Flow Health Monitor - Message Schema
 
-**Trigger version:** 3.2.1
+**Trigger version:** 3.3.0
 **Transport:** Open Data Stream (ODS) - Kafka or HTTP
-**Encoding:** JSON (one message per event)
+**Encoding:** JSON (one message per emission)
 
 ---
 
@@ -14,11 +14,11 @@ endpoints use static ports and the socket tuple is long-lived.
 
 Three distinct message types are emitted over the lifetime of a flow:
 
-| msg_type     | ExtraHop event | Fires                             | Purpose                                  |
-|--------------|----------------|-----------------------------------|------------------------------------------|
-| `flow_open`  | TCP_OPEN       | Once per flow                     | Birth certificate - identity + handshake |
-| `flow_tick`  | FLOW_TICK      | Per turn or per 128 payload bytes | Periodic TCP health snapshot             |
-| `flow_close` | TCP_CLOSE      | Once per flow                     | Death certificate - termination status   |
+| msg_type     | ExtraHop event | Emits                                          | Purpose                                  |
+|--------------|----------------|-------------------------------------------------|------------------------------------------|
+| `flow_open`  | TCP_OPEN       | Once per flow                                   | Birth certificate - identity + handshake |
+| `flow_tick`  | FLOW_TICK      | At most once per `EMIT_INTERVAL_MS` (default 10 s) | Aggregated TCP health snapshot           |
+| `flow_close` | TCP_CLOSE      | Once per flow (flushes any pending tick data first) | Death certificate - termination status   |
 
 All messages share a common envelope (version, msg_type, ts, flow_id) and a
 consistent positional naming convention described below.
@@ -55,7 +55,7 @@ Present in **every** message type.
 
 | Field      | Type    | Description                                                        |
 |------------|---------|--------------------------------------------------------------------|
-| `version`  | string  | Trigger version (e.g. `"3.2.0"`). Use for schema compatibility.   |
+| `version`  | string  | Trigger version (e.g. `"3.3.0"`). Use for schema compatibility.   |
 | `msg_type` | string  | One of `"flow_open"`, `"flow_tick"`, `"flow_close"`.               |
 | `ts`       | integer | Message emission time. Epoch milliseconds from `Date.now()`.       |
 | `flow_id`  | string  | ExtraHop-assigned unique flow identifier. Stable across all events for a given TCP connection. Join key. |
@@ -122,22 +122,34 @@ These fields are null on loose initiations.
 
 ## flow_tick
 
-Emitted on each **flow turn** (a complete request-response exchange) or after
-**128 bytes of payload** in one direction, whichever comes first. For ISO 8583
-traffic with short messages, ticks typically fire on turns. Tick intervals are
-**not** fixed-period - they are transaction-driven and variable in duration.
+The ExtraHop FLOW_TICK event still fires on each **flow turn** or after
+**128 bytes of payload**, whichever comes first. However, the trigger does
+**not** emit a Kafka message on every FLOW_TICK. Instead, it accumulates
+per-tick deltas in `Flow.store` and only emits a `flow_tick` message on
+the first FLOW_TICK after `EMIT_INTERVAL_MS` (default **10 seconds**) has
+elapsed since the last emission. This dramatically reduces Kafka message
+volume while preserving all counter data — no deltas are dropped.
+
+When a TCP_CLOSE fires, any accumulated but un-emitted tick data is flushed
+as a final `flow_tick` message immediately before the `flow_close` message.
+
+Because multiple platform-level ticks are folded into one emitted message,
+the interval between consecutive `flow_tick` messages is approximately
+`EMIT_INTERVAL_MS`, not the sub-second cadence of individual turns or
+128-byte thresholds.
 
 ### Value semantics
 
-Most values are **deltas since the last tick** - they represent activity in
-this interval only. The exceptions are noted below.
+Most values are **summed deltas across all platform ticks in the emission
+window** — they represent all activity since the last emitted `flow_tick`.
+The exceptions are noted below.
 
 | Treatment          | Applies to                                                    |
 |--------------------|---------------------------------------------------------------|
-| **Delta**          | retrans_bytes, rto, zero_wnd, rcv_wnd_throttle, nagle_delay, l4_bytes, pkts, frag_pkts, overlap_segments, l2_bytes_1, l2_bytes_2 |
-| **Per-interval**   | rtt_ms (median for this interval, not a delta or cumulative)  |
-| **Last-observed**  | dscp_1, dscp_2 (most recent value, not a count)               |
-| **Point-in-time**  | flow_age (current age of the flow at the time of this tick)   |
+| **Summed delta**   | retrans_bytes, rto, zero_wnd, rcv_wnd_throttle, nagle_delay, l4_bytes, pkts, frag_pkts, overlap_segments, l2_bytes_1, l2_bytes_2 |
+| **Last non-null**  | rtt_ms (last observed per-tick median RTT in the emission window; null if no ACK samples in the entire window) |
+| **Last-observed**  | dscp_1, dscp_2 (most recent value seen in the window, not a count) |
+| **Point-in-time**  | flow_age (age of the flow at the moment of emission)          |
 
 ### Identity echo
 
@@ -159,43 +171,43 @@ this interval only. The exceptions are noted below.
 
 | Field    | Type         | Description                                             |
 |----------|--------------|---------------------------------------------------------|
-| `rtt_ms` | number\|null | Median TCP round-trip time observed since the last tick, in milliseconds. Computed from ACK timing. `null` when no RTT samples exist in the interval (e.g. idle flow). |
+| `rtt_ms` | number\|null | Last observed per-tick median RTT within the emission window, in milliseconds. Computed from ACK timing. `null` when no RTT samples existed in any tick during the window (e.g. idle flow). |
 
 ### Retransmission
 
 | Field             | Type    | Description                                          |
 |-------------------|---------|------------------------------------------------------|
-| `retrans_bytes_1` | integer | Bytes retransmitted by endpoint 1 since last tick.   |
-| `retrans_bytes_2` | integer | Bytes retransmitted by endpoint 2 since last tick.   |
-| `rto_1`           | integer | Retransmission timeout events for endpoint 1 since last tick. An RTO indicates the sender's retransmit timer expired without receiving an ACK. |
-| `rto_2`           | integer | Retransmission timeout events for endpoint 2 since last tick. |
+| `retrans_bytes_1` | integer | Bytes retransmitted by endpoint 1 since last emission.   |
+| `retrans_bytes_2` | integer | Bytes retransmitted by endpoint 2 since last emission.   |
+| `rto_1`           | integer | Retransmission timeout events for endpoint 1 since last emission. An RTO indicates the sender's retransmit timer expired without receiving an ACK. |
+| `rto_2`           | integer | Retransmission timeout events for endpoint 2 since last emission. |
 
 ### Window health
 
 | Field                | Type    | Description                                     |
 |----------------------|---------|-------------------------------------------------|
-| `zero_wnd_1`         | integer | Zero-window advertisements sent by endpoint 1 since last tick. Indicates the receiver's buffer is full. |
-| `zero_wnd_2`         | integer | Zero-window advertisements from endpoint 2 since last tick. |
-| `rcv_wnd_throttle_1` | integer | Receive-window throttle events for endpoint 1 since last tick. Indicates the receive window shrank enough to throttle the sender. |
-| `rcv_wnd_throttle_2` | integer | Receive-window throttles for endpoint 2 since last tick. |
+| `zero_wnd_1`         | integer | Zero-window advertisements sent by endpoint 1 since last emission. Indicates the receiver's buffer is full. |
+| `zero_wnd_2`         | integer | Zero-window advertisements from endpoint 2 since last emission. |
+| `rcv_wnd_throttle_1` | integer | Receive-window throttle events for endpoint 1 since last emission. Indicates the receive window shrank enough to throttle the sender. |
+| `rcv_wnd_throttle_2` | integer | Receive-window throttles for endpoint 2 since last emission. |
 
 ### Nagle
 
 | Field           | Type    | Description                                       |
 |-----------------|---------|---------------------------------------------------|
-| `nagle_delay_1` | integer | Nagle-algorithm-induced delays for endpoint 1 since last tick. |
-| `nagle_delay_2` | integer | Nagle delays for endpoint 2 since last tick.      |
+| `nagle_delay_1` | integer | Nagle-algorithm-induced delays for endpoint 1 since last emission. |
+| `nagle_delay_2` | integer | Nagle delays for endpoint 2 since last emission.      |
 
 ### Throughput
 
 | Field        | Type    | Treatment      | Description                                         |
 |--------------|---------|----------------|-----------------------------------------------------|
-| `l4_bytes_1` | integer | **Delta**      | L4 payload bytes from endpoint 1 since last tick.   |
-| `l4_bytes_2` | integer | **Delta**      | L4 payload bytes from endpoint 2 since last tick.   |
-| `pkts_1`     | integer | **Delta**      | Packets from endpoint 1 since last tick.            |
-| `pkts_2`     | integer | **Delta**      | Packets from endpoint 2 since last tick.            |
-| `l2_bytes_1` | integer | **Delta**      | L2 bytes (including Ethernet headers) from endpoint 1 since flow start. |
-| `l2_bytes_2` | integer | **Delta**      | L2 bytes from endpoint 2 since flow start.          |
+| `l4_bytes_1` | integer | **Summed delta** | L4 payload bytes from endpoint 1 since last emission.   |
+| `l4_bytes_2` | integer | **Summed delta** | L4 payload bytes from endpoint 2 since last emission.   |
+| `pkts_1`     | integer | **Summed delta** | Packets from endpoint 1 since last emission.            |
+| `pkts_2`     | integer | **Summed delta** | Packets from endpoint 2 since last emission.            |
+| `l2_bytes_1` | integer | **Summed delta** | L2 bytes (including Ethernet headers) from endpoint 1 since last emission. |
+| `l2_bytes_2` | integer | **Summed delta** | L2 bytes from endpoint 2 since last emission.        |
 
 ### DSCP
 
@@ -208,10 +220,10 @@ this interval only. The exceptions are noted below.
 
 | Field                | Type    | Description                                     |
 |----------------------|---------|-------------------------------------------------|
-| `frag_pkts_1`        | integer | IP-fragmented packets from endpoint 1 since last tick. |
-| `frag_pkts_2`        | integer | Fragmented packets from endpoint 2 since last tick. |
-| `overlap_segments_1` | integer | Non-identical overlapping TCP segments from endpoint 1 since last tick. Two or more segments contained data for the same byte range. |
-| `overlap_segments_2` | integer | Overlapping segments from endpoint 2 since last tick. |
+| `frag_pkts_1`        | integer | IP-fragmented packets from endpoint 1 since last emission. |
+| `frag_pkts_2`        | integer | Fragmented packets from endpoint 2 since last emission. |
+| `overlap_segments_1` | integer | Non-identical overlapping TCP segments from endpoint 1 since last emission. Two or more segments contained data for the same byte range. |
+| `overlap_segments_2` | integer | Overlapping segments from endpoint 2 since last emission. |
 
 ---
 
@@ -319,7 +331,9 @@ attribution is required.
 
 ### Computing rates
 
-Since most tick values are deltas, rates are computed directly:
+Since most tick values are summed deltas over the emission window, rates are
+computed the same way as before — the `ts` gap between consecutive emissions
+is just wider (~10 s instead of sub-second):
 
 ```text
 interval_sec = (tick[N].ts - tick[N-1].ts) / 1000
@@ -351,7 +365,7 @@ handshake was not observed, so:
 
 - `handshake_ms`, `window_scale_*`, `init_rcv_wnd_*`, `ja4t_*` are all null
 - Sender/receiver attribution is unavailable
-- The first flow_tick values may not represent a complete interval
+- The first flow_tick emission may not represent a complete interval
 
 ### Handling null values
 
@@ -370,7 +384,7 @@ handshake was not observed, so:
 
 ```json
 {
-  "version": "3.2.0",
+  "version": "3.3.0",
   "msg_type": "flow_open",
   "ts": 1711900800000,
   "flow_id": "FMak3xB7hMC",
@@ -398,7 +412,7 @@ handshake was not observed, so:
 
 ```json
 {
-  "version": "3.2.0",
+  "version": "3.3.0",
   "msg_type": "flow_open",
   "ts": 1711900800000,
   "flow_id": "GNbl4yC8iND",
@@ -426,7 +440,7 @@ handshake was not observed, so:
 
 ```json
 {
-  "version": "3.2.0",
+  "version": "3.3.0",
   "msg_type": "flow_tick",
   "ts": 1711900830000,
   "flow_id": "FMak3xB7hMC",
@@ -466,7 +480,7 @@ handshake was not observed, so:
 
 ```json
 {
-  "version": "3.2.0",
+  "version": "3.3.0",
   "msg_type": "flow_close",
   "ts": 1711987200000,
   "flow_id": "FMak3xB7hMC",
