@@ -27,7 +27,8 @@
 //
 // Rate:    FLOW_TICK deltas are accumulated in Flow.store and emitted at
 //          most once per EMIT_INTERVAL_MS (default 10 s). TCP_CLOSE flushes
-//          any remaining accumulated data before the close message.
+//          any already-accumulated data and marks the flow closed so any
+//          later FLOW_TICK emits immediately.
 //
 // Output:  JSON messages via ODS:
 //            - flow_open:  Peer identity + TCP handshake parameters
@@ -43,6 +44,80 @@ var KAFKA_TOPIC      = "";         // Kafka topic for flow health messages
 var VERSION          = "3.3.0";    // Schema version for warehouse
 var EMIT_INTERVAL_MS = 10000;      // Min ms between flow_tick emissions (10 s)
 
+function buildIdentity(senderIs1) {
+    return {
+        ip_1:        Flow.ipaddr1,
+        port_1:      Flow.port1,
+        mac_1:       Flow.device1 ? Flow.device1.hwaddr : null,
+        ip_2:        Flow.ipaddr2,
+        port_2:      Flow.port2,
+        mac_2:       Flow.device2 ? Flow.device2.hwaddr : null,
+        sender_is_1: senderIs1
+    };
+}
+
+function ensureIdentity() {
+    var identity = Flow.store.identity;
+    if (!identity) {
+        identity = buildIdentity(null);
+        Flow.store.identity = identity;
+    }
+    return identity;
+}
+
+function getTcpOptionValue(options, kind) {
+    if (!options) { return null; }
+
+    for (var i = 0; i < options.length; i++) {
+        var option = options[i];
+        if (option && option.kind === kind) {
+            return option.value !== undefined ? option.value : null;
+        }
+    }
+
+    return null;
+}
+
+function buildTickMessage(identity, accum, timestamp) {
+    return {
+        version:  VERSION,
+        msg_type: "flow_tick",
+        ts:       timestamp,
+        flow_id:  Flow.id,
+        flow_age: Flow.age,
+
+        ip_1:        identity.ip_1,
+        port_1:      identity.port_1,
+        ip_2:        identity.ip_2,
+        port_2:      identity.port_2,
+        sender_is_1: identity.sender_is_1,
+
+        rtt_ms:             accum.rtt_ms,
+        retrans_bytes_1:    accum.retrans_bytes_1,
+        retrans_bytes_2:    accum.retrans_bytes_2,
+        rto_1:              accum.rto_1,
+        rto_2:              accum.rto_2,
+        zero_wnd_1:         accum.zero_wnd_1,
+        zero_wnd_2:         accum.zero_wnd_2,
+        rcv_wnd_throttle_1: accum.rcv_wnd_throttle_1,
+        rcv_wnd_throttle_2: accum.rcv_wnd_throttle_2,
+        nagle_delay_1:      accum.nagle_delay_1,
+        nagle_delay_2:      accum.nagle_delay_2,
+        l4_bytes_1:         accum.l4_bytes_1,
+        l4_bytes_2:         accum.l4_bytes_2,
+        pkts_1:             accum.pkts_1,
+        pkts_2:             accum.pkts_2,
+        l2_bytes_1:         accum.l2_bytes_1,
+        l2_bytes_2:         accum.l2_bytes_2,
+        dscp_1:             accum.dscp_1,
+        dscp_2:             accum.dscp_2,
+        frag_pkts_1:        accum.frag_pkts_1,
+        frag_pkts_2:        accum.frag_pkts_2,
+        overlap_segments_1: accum.overlap_segments_1,
+        overlap_segments_2: accum.overlap_segments_2
+    };
+}
+
 // ========================= TCP_OPEN =========================================
 // Fires once per flow when a TCP connection is initiated. If the 3-way
 // handshake was observed, handshake parameters and sender identification
@@ -51,12 +126,6 @@ var EMIT_INTERVAL_MS = 10000;      // Min ms between flow_tick emissions (10 s)
 // ============================================================================
 
 if (event === "TCP_OPEN") {
-
-    // Positional identity — stable for the lifetime of this flow
-    var ip_1  = Flow.ipaddr1,
-        ip_2  = Flow.ipaddr2,
-        mac_1 = Flow.device1 ? Flow.device1.hwaddr : null,
-        mac_2 = Flow.device2 ? Flow.device2.hwaddr : null;
 
     // Determine if we observed the 3-way handshake.
     // A non-null, non-NaN handshakeTime > 0 means we saw it.
@@ -67,17 +136,8 @@ if (event === "TCP_OPEN") {
     // Map that knowledge to our positional convention.
     var senderIs1 = saw3whs ? (Flow.client.port === Flow.port1) : null;
 
-    var identity = {
-        ip_1:        ip_1,
-        port_1:      Flow.port1,
-        mac_1:       mac_1,
-        ip_2:        ip_2,
-        port_2:      Flow.port2,
-        mac_2:       mac_2,
-        sender_is_1: senderIs1
-    };
-
     // Persist for FLOW_TICK and TCP_CLOSE
+    var identity = buildIdentity(senderIs1);
     Flow.store.identity = identity;
 
     // TCP options — only meaningful when 3WHS was observed
@@ -89,12 +149,8 @@ if (event === "TCP_OPEN") {
         ja4_2 = null;
 
     if (saw3whs) {
-        var opts1 = TCP.options1;
-        var opts2 = TCP.options2;
-        var wsOpt1 = opts1 ? opts1.find(function(opt) { return opt.kind === 3; }) : null;
-        var wsOpt2 = opts2 ? opts2.find(function(opt) { return opt.kind === 3; }) : null;
-        ws_1  = (wsOpt1 && wsOpt1.value !== undefined) ? wsOpt1.value : null;
-        ws_2  = (wsOpt2 && wsOpt2.value !== undefined) ? wsOpt2.value : null;
+        ws_1  = getTcpOptionValue(TCP.options1, 3);
+        ws_2  = getTcpOptionValue(TCP.options2, 3);
         wnd_1 = TCP.initRcvWndSize1;
         wnd_2 = TCP.initRcvWndSize2;
         ja4_1 = TCP.ja4TCPClient || null;
@@ -147,7 +203,9 @@ if (event === "TCP_OPEN") {
 //
 // To reduce Kafka message volume, deltas from each tick are accumulated in
 // Flow.store.accum and only emitted when EMIT_INTERVAL_MS has elapsed since
-// the last send. TCP_CLOSE flushes any remaining accumulated data.
+// the last send. TCP_CLOSE flushes any already-accumulated data; if a final
+// FLOW_TICK arrives after TCP_CLOSE, it bypasses the interval and emits
+// immediately.
 //
 // Counter values from the platform are deltas since the last FLOW_TICK.
 // RTT is the median observed since the last tick — we keep the last non-null
@@ -158,19 +216,7 @@ if (event === "TCP_OPEN") {
 if (event === "FLOW_TICK") {
 
     // Retrieve identity from Flow.store, or late-init if we missed TCP_OPEN
-    var id = Flow.store.identity;
-    if (!id) {
-        id = {
-            ip_1:        Flow.ipaddr1,
-            port_1:      Flow.port1,
-            mac_1:       Flow.device1 ? Flow.device1.hwaddr : null,
-            ip_2:        Flow.ipaddr2,
-            port_2:      Flow.port2,
-            mac_2:       Flow.device2 ? Flow.device2.hwaddr : null,
-            sender_is_1: null
-        };
-        Flow.store.identity = id;
-    }
+    var id = ensureIdentity();
 
     // Initialize the accumulator on first tick
     var a = Flow.store.accum;
@@ -219,58 +265,21 @@ if (event === "FLOW_TICK") {
 
     // RTT: keep the last non-null median seen in this window
     var rtt = Flow.roundTripTime;
-    if (rtt === rtt) { a.rtt_ms = rtt; }   // NaN !== NaN, so this filters NaN
+    if (rtt !== null && rtt === rtt) {   // NaN !== NaN, so this filters NaN
+        a.rtt_ms = rtt;
+    }
 
     // DSCP: last-observed, just overwrite
     a.dscp_1 = Flow.dscp1;
     a.dscp_2 = Flow.dscp2;
 
-    // Emit only when the interval has elapsed
+    // Emit only when the interval has elapsed. Closed flows can receive final
+    // FLOW_TICK events after TCP_CLOSE, so emit those immediately.
     var now = Date.now();
-    if ((now - Flow.store.lastEmitTs) < EMIT_INTERVAL_MS) { return; }
+    var closed = Flow.store.closed || false;
+    if (!closed && ((now - Flow.store.lastEmitTs) < EMIT_INTERVAL_MS)) { return; }
 
-    var message = {
-        version:  VERSION,
-        msg_type: "flow_tick",
-        ts:       now,
-        flow_id:  Flow.id,
-        flow_age: Flow.age,
-
-        // Identity echo
-        ip_1:        id.ip_1,
-        port_1:      id.port_1,
-        ip_2:        id.ip_2,
-        port_2:      id.port_2,
-        sender_is_1: id.sender_is_1,
-
-        // Latency — last observed RTT in this window; null if none
-        rtt_ms: a.rtt_ms,
-
-        // Accumulated deltas for this emission window
-        retrans_bytes_1:    a.retrans_bytes_1,
-        retrans_bytes_2:    a.retrans_bytes_2,
-        rto_1:              a.rto_1,
-        rto_2:              a.rto_2,
-        zero_wnd_1:         a.zero_wnd_1,
-        zero_wnd_2:         a.zero_wnd_2,
-        rcv_wnd_throttle_1: a.rcv_wnd_throttle_1,
-        rcv_wnd_throttle_2: a.rcv_wnd_throttle_2,
-        nagle_delay_1:      a.nagle_delay_1,
-        nagle_delay_2:      a.nagle_delay_2,
-        l4_bytes_1:         a.l4_bytes_1,
-        l4_bytes_2:         a.l4_bytes_2,
-        pkts_1:             a.pkts_1,
-        pkts_2:             a.pkts_2,
-        l2_bytes_1:         a.l2_bytes_1,
-        l2_bytes_2:         a.l2_bytes_2,
-        dscp_1:             a.dscp_1,
-        dscp_2:             a.dscp_2,
-        frag_pkts_1:        a.frag_pkts_1,
-        frag_pkts_2:        a.frag_pkts_2,
-        overlap_segments_1: a.overlap_segments_1,
-        overlap_segments_2: a.overlap_segments_2
-    };
-
+    var message = buildTickMessage(id, a, now);
     Remote.Kafka(KAFKA_TARGET).send(KAFKA_TOPIC, JSON.stringify(message));
 
     // Reset accumulator and timestamp
@@ -283,8 +292,9 @@ if (event === "FLOW_TICK") {
 // Fires once when the TCP connection terminates.
 //
 // If there is unflushed data in Flow.store.accum (accumulated since the last
-// emitted tick), we flush it as a final flow_tick before emitting flow_close.
-// This ensures no delta data is lost for the tail of the flow.
+// emitted tick), we flush it as a flow_tick before emitting flow_close. The
+// flow is also marked closed so any later FLOW_TICK bypasses the rate limiter
+// and emits the true final deltas immediately.
 //
 // Terminology:
 //   shutdown = this endpoint sent a FIN (graceful close)
@@ -294,55 +304,17 @@ if (event === "FLOW_TICK") {
 
 if (event === "TCP_CLOSE") {
 
-    var id = Flow.store.identity;
+    Flow.store.closed = true;
+    var id = ensureIdentity();
 
     // Determine which positional slot maps to client vs server
     var clientPort = Flow.client.port;
     var clientIs1  = (clientPort === Flow.port1);
 
-    // If we never captured identity or saw a FLOW_TICK, do not emit
-    if (!id) { return; }
-
     // Flush any remaining accumulated tick data
     var a = Flow.store.accum;
     if (a) {
-        var flushMsg = {
-            version:  VERSION,
-            msg_type: "flow_tick",
-            ts:       Date.now(),
-            flow_id:  Flow.id,
-            flow_age: Flow.age,
-
-            ip_1:        id.ip_1,
-            port_1:      id.port_1,
-            ip_2:        id.ip_2,
-            port_2:      id.port_2,
-            sender_is_1: id.sender_is_1,
-
-            rtt_ms:             a.rtt_ms,
-            retrans_bytes_1:    a.retrans_bytes_1,
-            retrans_bytes_2:    a.retrans_bytes_2,
-            rto_1:              a.rto_1,
-            rto_2:              a.rto_2,
-            zero_wnd_1:         a.zero_wnd_1,
-            zero_wnd_2:         a.zero_wnd_2,
-            rcv_wnd_throttle_1: a.rcv_wnd_throttle_1,
-            rcv_wnd_throttle_2: a.rcv_wnd_throttle_2,
-            nagle_delay_1:      a.nagle_delay_1,
-            nagle_delay_2:      a.nagle_delay_2,
-            l4_bytes_1:         a.l4_bytes_1,
-            l4_bytes_2:         a.l4_bytes_2,
-            pkts_1:             a.pkts_1,
-            pkts_2:             a.pkts_2,
-            l2_bytes_1:         a.l2_bytes_1,
-            l2_bytes_2:         a.l2_bytes_2,
-            dscp_1:             a.dscp_1,
-            dscp_2:             a.dscp_2,
-            frag_pkts_1:        a.frag_pkts_1,
-            frag_pkts_2:        a.frag_pkts_2,
-            overlap_segments_1: a.overlap_segments_1,
-            overlap_segments_2: a.overlap_segments_2
-        };
+        var flushMsg = buildTickMessage(id, a, Date.now());
         Remote.Kafka(KAFKA_TARGET).send(KAFKA_TOPIC, JSON.stringify(flushMsg));
         Flow.store.accum = null;
     }

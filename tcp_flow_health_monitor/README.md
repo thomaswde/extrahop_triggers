@@ -17,8 +17,8 @@ Three distinct message types are emitted over the lifetime of a flow:
 | msg_type     | ExtraHop event | Emits                                          | Purpose                                  |
 |--------------|----------------|-------------------------------------------------|------------------------------------------|
 | `flow_open`  | TCP_OPEN       | Once per flow                                   | Birth certificate - identity + handshake |
-| `flow_tick`  | FLOW_TICK      | At most once per `EMIT_INTERVAL_MS` (default 10 s) | Aggregated TCP health snapshot           |
-| `flow_close` | TCP_CLOSE      | Once per flow (flushes any pending tick data first) | Death certificate - termination status   |
+| `flow_tick`  | FLOW_TICK      | At most once per `EMIT_INTERVAL_MS` (post-close ticks emit immediately) | Aggregated TCP health snapshot           |
+| `flow_close` | TCP_CLOSE      | Once per flow (marks closed and flushes pending tick data first) | Death certificate - termination status   |
 
 All messages share a common envelope (version, msg_type, ts, flow_id) and a
 consistent positional naming convention described below.
@@ -131,12 +131,17 @@ elapsed since the last emission. This dramatically reduces Kafka message
 volume while preserving all counter data — no deltas are dropped.
 
 When a TCP_CLOSE fires, any accumulated but un-emitted tick data is flushed
-as a final `flow_tick` message immediately before the `flow_close` message.
+as a `flow_tick` message immediately before the `flow_close` message. The
+trigger also marks the flow closed in `Flow.store`; if one or more final
+FLOW_TICK events arrive after TCP_CLOSE, those ticks bypass the emit interval
+and are sent immediately so tail deltas are not stranded behind the rate
+limiter.
 
-Because multiple platform-level ticks are folded into one emitted message,
-the interval between consecutive `flow_tick` messages is approximately
-`EMIT_INTERVAL_MS`, not the sub-second cadence of individual turns or
-128-byte thresholds.
+For open flows, multiple platform-level ticks are folded into one emitted
+message, so the interval between consecutive `flow_tick` messages is
+approximately `EMIT_INTERVAL_MS`, not the sub-second cadence of individual
+turns or 128-byte thresholds. Post-close ticks are the exception: they are
+emitted as they arrive.
 
 ### Value semantics
 
