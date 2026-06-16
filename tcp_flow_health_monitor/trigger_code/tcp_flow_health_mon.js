@@ -9,18 +9,14 @@
 //
 // Design:  All metrics use the ExtraHop positional convention (_1 / _2).
 //          Device 1 and Device 2 are assigned by the platform when the flow
-//          is created and remain consistent for the flow's lifetime.
+//          is created and remain consistent for the flow's lifetime, so the
+//          IP / port / MAC for each position are read directly from Flow in
+//          every event rather than cached.
 //
-//          The identity of each position (IP, port, MAC) is captured once at
-//          TCP_OPEN and persisted in Flow.store. Every subsequent event
-//          references this stored identity and emits all counters using the
-//          same _1 / _2 convention, providing a stable frame of reference
-//          without imposing client/server or source/dest semantics.
-//
-//          When the TCP 3-way handshake is observed, the trigger determines
-//          which positional slot corresponds to the SYN sender and records
-//          this in the sender_is_1 field. For loose flow initiations (where
-//          the handshake was not observed), sender_is_1 is null.
+//          The only derived value that must persist is sender_is_1. When the
+//          TCP 3-way handshake is observed, the trigger determines which
+//          positional slot sent the SYN and stores that flag at TCP_OPEN.
+//          For loose flow initiations (handshake not observed), it is null.
 //
 //          The warehouse receives typed messages and owns all labeling,
 //          rate calculations, and DSCP name resolution.
@@ -36,49 +32,31 @@
 //            - flow_close: Connection termination status
 // ============================================================================
 
-
 // ========================= Configuration ====================================
-
 var KAFKA_TARGET     = "";         // ODS target name configured in ExtraHop admin
 var KAFKA_TOPIC      = "";         // Kafka topic for flow health messages
-var VERSION          = "3.3.0";    // Schema version for warehouse
+var VERSION          = "3.3.0";    // Wire schema version for warehouse (unchanged)
 var EMIT_INTERVAL_MS = 10000;      // Min ms between flow_tick emissions (10 s)
 
-function buildIdentity(senderIs1) {
-    return {
-        ip_1:        Flow.ipaddr1,
-        port_1:      Flow.port1,
-        mac_1:       Flow.device1 ? Flow.device1.hwaddr : null,
-        ip_2:        Flow.ipaddr2,
-        port_2:      Flow.port2,
-        mac_2:       Flow.device2 ? Flow.device2.hwaddr : null,
-        sender_is_1: senderIs1
-    };
-}
-
-function ensureIdentity() {
-    var identity = Flow.store.identity;
-    if (!identity) {
-        identity = buildIdentity(null);
-        Flow.store.identity = identity;
-    }
-    return identity;
+// sender_is_1 is the only derived value persisted across events. It is set at
+// TCP_OPEN; undefined here means we never saw TCP_OPEN, so report null.
+function storedSenderIs1() {
+    var v = Flow.store.senderIs1;
+    return v === undefined ? null : v;
 }
 
 function getTcpOptionValue(options, kind) {
     if (!options) { return null; }
-
     for (var i = 0; i < options.length; i++) {
         var option = options[i];
         if (option && option.kind === kind) {
             return option.value !== undefined ? option.value : null;
         }
     }
-
     return null;
 }
 
-function buildTickMessage(identity, accum, timestamp) {
+function buildTickMessage(accum, timestamp) {
     return {
         version:  VERSION,
         msg_type: "flow_tick",
@@ -86,11 +64,11 @@ function buildTickMessage(identity, accum, timestamp) {
         flow_id:  Flow.id,
         flow_age: Flow.age,
 
-        ip_1:        identity.ip_1,
-        port_1:      identity.port_1,
-        ip_2:        identity.ip_2,
-        port_2:      identity.port_2,
-        sender_is_1: identity.sender_is_1,
+        ip_1:        Flow.ipaddr1,
+        port_1:      Flow.port1,
+        ip_2:        Flow.ipaddr2,
+        port_2:      Flow.port2,
+        sender_is_1: storedSenderIs1(),
 
         rtt_ms:             accum.rtt_ms,
         retrans_bytes_1:    accum.retrans_bytes_1,
@@ -124,21 +102,16 @@ function buildTickMessage(identity, accum, timestamp) {
 // are available. For loose initiations (mid-stream pickup), handshake-
 // dependent values will be null.
 // ============================================================================
-
 if (event === "TCP_OPEN") {
-
-    // Determine if we observed the 3-way handshake.
-    // A non-null, non-NaN handshakeTime > 0 means we saw it.
-    var hsTime    = TCP.handshakeTime;
-    var saw3whs   = (hsTime !== null && hsTime === hsTime && hsTime > 0);
+    // A positive handshakeTime means we observed the 3-way handshake.
+    // (null / NaN / 0 all fail > 0, so no extra guards are needed.)
+    var hsTime  = TCP.handshakeTime;
+    var saw3whs = hsTime > 0;
 
     // When the handshake was observed, we know which side sent the SYN.
-    // Map that knowledge to our positional convention.
+    // Map that to our positional convention and persist it for later events.
     var senderIs1 = saw3whs ? (Flow.client.port === Flow.port1) : null;
-
-    // Persist for FLOW_TICK and TCP_CLOSE
-    var identity = buildIdentity(senderIs1);
-    Flow.store.identity = identity;
+    Flow.store.senderIs1 = senderIs1;
 
     // TCP options — only meaningful when 3WHS was observed
     var ws_1  = null,
@@ -164,18 +137,18 @@ if (event === "TCP_OPEN") {
         flow_id:  Flow.id,
 
         // Peer identity
-        ip_1:   identity.ip_1,
-        port_1: identity.port_1,
-        mac_1:  identity.mac_1,
-        ip_2:   identity.ip_2,
-        port_2: identity.port_2,
-        mac_2:  identity.mac_2,
+        ip_1:   Flow.ipaddr1,
+        port_1: Flow.port1,
+        mac_1:  Flow.device1 ? Flow.device1.hwaddr : null,
+        ip_2:   Flow.ipaddr2,
+        port_2: Flow.port2,
+        mac_2:  Flow.device2 ? Flow.device2.hwaddr : null,
 
         // Sender identification
         // true:  3WHS observed, position 1 is the SYN sender
         // false: 3WHS observed, position 2 is the SYN sender
         // null:  loose init, sender unknown
-        sender_is_1: identity.sender_is_1,
+        sender_is_1: senderIs1,
 
         // Network context
         ip_proto:   Flow.ipproto,
@@ -197,7 +170,6 @@ if (event === "TCP_OPEN") {
     Remote.Kafka(KAFKA_TARGET).send(KAFKA_TOPIC, JSON.stringify(message));
 }
 
-
 // ========================= FLOW_TICK ========================================
 // Fires on each flow turn or after 128 bytes of payload, whichever is first.
 //
@@ -212,12 +184,7 @@ if (event === "TCP_OPEN") {
 // value seen across the accumulation window.
 // DSCP is last-observed — we keep the latest value.
 // ============================================================================
-
 if (event === "FLOW_TICK") {
-
-    // Retrieve identity from Flow.store, or late-init if we missed TCP_OPEN
-    var id = ensureIdentity();
-
     // Initialize the accumulator on first tick
     var a = Flow.store.accum;
     if (!a) {
@@ -237,6 +204,7 @@ if (event === "FLOW_TICK") {
         };
         Flow.store.accum = a;
     }
+
     if (!Flow.store.lastEmitTs) {
         Flow.store.lastEmitTs = Date.now();
     }
@@ -263,9 +231,11 @@ if (event === "FLOW_TICK") {
     a.overlap_segments_1 += Flow.overlapSegments1;
     a.overlap_segments_2 += Flow.overlapSegments2;
 
-    // RTT: keep the last non-null median seen in this window
+    // RTT: keep the last real median in this window. Flow.roundTripTime is
+    // NaN when a tick had no samples; NaN would overwrite a good value and
+    // JSON.stringify emits NaN as null, so reject it explicitly.
     var rtt = Flow.roundTripTime;
-    if (rtt !== null && rtt === rtt) {   // NaN !== NaN, so this filters NaN
+    if (rtt !== null && !isNaN(rtt)) {
         a.rtt_ms = rtt;
     }
 
@@ -276,17 +246,15 @@ if (event === "FLOW_TICK") {
     // Emit only when the interval has elapsed. Closed flows can receive final
     // FLOW_TICK events after TCP_CLOSE, so emit those immediately.
     var now = Date.now();
-    var closed = Flow.store.closed || false;
-    if (!closed && ((now - Flow.store.lastEmitTs) < EMIT_INTERVAL_MS)) { return; }
+    if (!Flow.store.closed && ((now - Flow.store.lastEmitTs) < EMIT_INTERVAL_MS)) { return; }
 
-    var message = buildTickMessage(id, a, now);
+    var message = buildTickMessage(a, now);
     Remote.Kafka(KAFKA_TARGET).send(KAFKA_TOPIC, JSON.stringify(message));
 
     // Reset accumulator and timestamp
     Flow.store.lastEmitTs = now;
     Flow.store.accum = null;
 }
-
 
 // ========================= TCP_CLOSE ========================================
 // Fires once when the TCP connection terminates.
@@ -301,25 +269,22 @@ if (event === "FLOW_TICK") {
 //   reset    = this endpoint sent a RST after the flow was established
 //   aborted  = this endpoint sent a RST before the flow was established
 // ============================================================================
-
 if (event === "TCP_CLOSE") {
-
     Flow.store.closed = true;
-    var id = ensureIdentity();
-
-    // Determine which positional slot maps to client vs server
-    var clientPort = Flow.client.port;
-    var clientIs1  = (clientPort === Flow.port1);
 
     // Flush any remaining accumulated tick data
     var a = Flow.store.accum;
     if (a) {
-        var flushMsg = buildTickMessage(id, a, Date.now());
+        var flushMsg = buildTickMessage(a, Date.now());
         Remote.Kafka(KAFKA_TARGET).send(KAFKA_TOPIC, JSON.stringify(flushMsg));
         Flow.store.accum = null;
     }
 
-    // Read role-based termination booleans
+    // Determine which positional slot maps to client vs server
+    var clientIs1 = (Flow.client.port === Flow.port1);
+
+    // Role-based termination booleans (|| false guards an unobserved side,
+    // which can report null, from leaking into the wire schema)
     var clientShutdown = Flow.client.isShutdown || false;
     var serverShutdown = Flow.server.isShutdown || false;
     var clientReset    = TCP.client.isReset     || false;
@@ -335,11 +300,11 @@ if (event === "TCP_CLOSE") {
         flow_age: Flow.age,
 
         // Identity echo
-        ip_1:        id.ip_1,
-        port_1:      id.port_1,
-        ip_2:        id.ip_2,
-        port_2:      id.port_2,
-        sender_is_1: id.sender_is_1,
+        ip_1:        Flow.ipaddr1,
+        port_1:      Flow.port1,
+        ip_2:        Flow.ipaddr2,
+        port_2:      Flow.port2,
+        sender_is_1: storedSenderIs1(),
 
         // Graceful shutdown — this endpoint sent FIN
         shutdown_1: clientIs1 ? clientShutdown : serverShutdown,
