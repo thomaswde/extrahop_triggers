@@ -104,7 +104,6 @@ function buildTickMessage(accum, timestamp) {
 // ============================================================================
 if (event === "TCP_OPEN") {
     // A positive handshakeTime means we observed the 3-way handshake.
-    // (null / NaN / 0 all fail > 0, so no extra guards are needed.)
     var hsTime  = TCP.handshakeTime;
     var saw3whs = hsTime > 0;
 
@@ -185,7 +184,6 @@ if (event === "TCP_OPEN") {
 // DSCP is last-observed — we keep the latest value.
 // ============================================================================
 if (event === "FLOW_TICK") {
-    // Initialize the accumulator on first tick
     var a = Flow.store.accum;
     if (!a) {
         a = {
@@ -239,7 +237,6 @@ if (event === "FLOW_TICK") {
         a.rtt_ms = rtt;
     }
 
-    // DSCP: last-observed, just overwrite
     a.dscp_1 = Flow.dscp1;
     a.dscp_2 = Flow.dscp2;
 
@@ -251,7 +248,6 @@ if (event === "FLOW_TICK") {
     var message = buildTickMessage(a, now);
     Remote.Kafka(KAFKA_TARGET).send(KAFKA_TOPIC, JSON.stringify(message));
 
-    // Reset accumulator and timestamp
     Flow.store.lastEmitTs = now;
     Flow.store.accum = null;
 }
@@ -272,7 +268,6 @@ if (event === "FLOW_TICK") {
 if (event === "TCP_CLOSE") {
     Flow.store.closed = true;
 
-    // Flush any remaining accumulated tick data
     var a = Flow.store.accum;
     if (a) {
         var flushMsg = buildTickMessage(a, Date.now());
@@ -280,7 +275,6 @@ if (event === "TCP_CLOSE") {
         Flow.store.accum = null;
     }
 
-    // Determine which positional slot maps to client vs server
     var clientIs1 = (Flow.client.port === Flow.port1);
 
     // Role-based termination booleans (|| false guards an unobserved side,
