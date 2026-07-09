@@ -1,8 +1,9 @@
 # TCP Flow Health Monitor - Message Schema
 
-**Trigger version:** 3.3.0
-**Transport:** Open Data Stream (ODS) - Kafka or HTTP
-**Encoding:** JSON (one message per emission)
+**Trigger version:** 4.0.0
+**Schema version:** 3.3.0
+**Transport:** Open Data Stream (ODS) - Kafka
+**Encoding:** JSON (one message per Kafka record)
 
 ---
 
@@ -16,9 +17,9 @@ Three distinct message types are emitted over the lifetime of a flow:
 
 | msg_type     | ExtraHop event | Emits                                          | Purpose                                  |
 |--------------|----------------|-------------------------------------------------|------------------------------------------|
-| `flow_open`  | TCP_OPEN       | Once per flow                                   | Birth certificate - identity + handshake |
-| `flow_tick`  | FLOW_TICK      | At most once per `EMIT_INTERVAL_MS` (post-close ticks emit immediately) | Aggregated TCP health snapshot           |
-| `flow_close` | TCP_CLOSE      | Once per flow (marks closed and flushes pending tick data first) | Death certificate - termination status   |
+| `flow_open`  | TCP_OPEN       | Once per flow; duplicate resumed-flow opens are suppressed | Birth certificate - identity + handshake |
+| `flow_tick`  | FLOW_TICK, SESSION_EXPIRE, TCP_CLOSE | Batched no sooner than 10 seconds; idle batches flush on session expiration; close drains pending data first | Aggregated TCP health snapshot           |
+| `flow_close` | TCP_CLOSE      | Once per flow                                   | Death certificate - termination status   |
 
 All messages share a common envelope (version, msg_type, ts, flow_id) and a
 consistent positional naming convention described below.
@@ -39,9 +40,13 @@ fields to build a lookup (e.g. "position 1 = 10.1.2.3:8583, position 2 =
 
 When the TCP 3-way handshake is observed, the `sender_is_1` field indicates
 which position corresponds to the connection initiator (the SYN sender). That
-value is stored in `Flow.store.identity` and echoed in every subsequent
+value is stored in `Flow.store.senderIs1` and echoed in every subsequent
 `flow_tick` and `flow_close` message for the same `flow_id`. For loose
 initiations, `sender_is_1` is null.
+
+Endpoint role checks use the full `(ip, port)` tuple, not port alone. This is
+important for peer-to-peer ISO 8583 environments where both endpoints can use
+the same static port.
 
 Every subsequent `flow_tick` and `flow_close` message for the same `flow_id`
 uses the same positional assignment. Counters ending in `_1` always refer to
@@ -55,9 +60,9 @@ Present in **every** message type.
 
 | Field      | Type    | Description                                                        |
 |------------|---------|--------------------------------------------------------------------|
-| `version`  | string  | Trigger version (e.g. `"3.3.0"`). Use for schema compatibility.   |
+| `version`  | string  | Wire schema version (currently `"3.3.0"`). Use for schema compatibility. |
 | `msg_type` | string  | One of `"flow_open"`, `"flow_tick"`, `"flow_close"`.               |
-| `ts`       | integer | Message emission time. Epoch milliseconds from `Date.now()`.       |
+| `ts`       | integer | Epoch milliseconds. For `flow_open` and `flow_close`, this is emission time. For `flow_tick`, this is the time of the last merged FLOW_TICK data in the batch. |
 | `flow_id`  | string  | ExtraHop-assigned unique flow identifier. Stable across all events for a given TCP connection. Join key. |
 
 ---
@@ -71,6 +76,11 @@ including "loose initiations" where the 3-way handshake was not observed
 When the handshake is observed, the message includes negotiated TCP parameters
 and authoritative sender identification. For loose initiations, handshake-
 dependent values are null.
+
+ExtraHop can run `TCP_OPEN` again if a stalled connection resumes within the
+same flow. The trigger suppresses duplicate `flow_open` messages in that case
+and preserves the original `sender_is_1`. If a connection resumes after flow
+expiry, ExtraHop creates a new flow and the trigger emits a new `flow_open`.
 
 ### Identity
 
@@ -125,36 +135,46 @@ These fields are null on loose initiations.
 The ExtraHop FLOW_TICK event still fires on each **flow turn** or after
 **128 bytes of payload**, whichever comes first. However, the trigger does
 **not** emit a Kafka message on every FLOW_TICK. Instead, it accumulates
-per-tick deltas in `Flow.store` and only emits a `flow_tick` message on
-the first FLOW_TICK after `EMIT_INTERVAL_MS` (default **10 seconds**) has
-elapsed since the last emission. This dramatically reduces Kafka message
-volume while preserving all counter data — no deltas are dropped.
+per-tick deltas in the ExtraHop session table under a flow-specific key.
 
-When a TCP_CLOSE fires, any accumulated but un-emitted tick data is flushed
-as a `flow_tick` message immediately before the `flow_close` message. The
-trigger also marks the flow closed in `Flow.store`; if one or more final
-FLOW_TICK events arrive after TCP_CLOSE, those ticks bypass the emit interval
-and are sent immediately so tail deltas are not stranded behind the rate
-limiter.
+Each pending session entry expires after `SESSION_EXPIRE_S` (default
+**10 seconds**) with `notify: true`. If another FLOW_TICK arrives after the
+minimum batch age has elapsed, the trigger removes the pending session entry
+and emits the accumulated batch immediately. If the flow goes quiet, the
+`SESSION_EXPIRE` event flushes the expired batch. In current ExtraHop
+references, `SESSION_EXPIRE` runs periodically in approximately 30-second
+increments while the session table is in use.
+
+This gives the trigger two flush paths for open flows:
+
+- active flows flush no sooner than 10 seconds when the next FLOW_TICK arrives
+- idle long-lived flows flush on SESSION_EXPIRE instead of waiting minutes for
+  another flow event
+
+When TCP_CLOSE fires, any pending tick data is removed from the session table
+and emitted as a `flow_tick` message immediately before the `flow_close`
+message. The trigger also marks the flow closed in `Flow.store`; if one or
+more final FLOW_TICK events arrive after TCP_CLOSE, those ticks bypass the
+session buffer and are sent immediately so tail deltas are not stranded behind
+the rate limiter.
 
 For open flows, multiple platform-level ticks are folded into one emitted
-message, so the interval between consecutive `flow_tick` messages is
-approximately `EMIT_INTERVAL_MS`, not the sub-second cadence of individual
-turns or 128-byte thresholds. Post-close ticks are the exception: they are
-emitted as they arrive.
+message. The `flow_tick.ts` field is the timestamp of the last merged
+FLOW_TICK, not necessarily the time the batch was emitted by SESSION_EXPIRE.
+Post-close ticks are the exception: they are emitted as they arrive.
 
 ### Value semantics
 
-Most values are **summed deltas across all platform ticks in the emission
+Most values are **summed deltas across all platform ticks in the batch
 window** — they represent all activity since the last emitted `flow_tick`.
 The exceptions are noted below.
 
 | Treatment          | Applies to                                                    |
 |--------------------|---------------------------------------------------------------|
 | **Summed delta**   | retrans_bytes, rto, zero_wnd, rcv_wnd_throttle, nagle_delay, l4_bytes, pkts, frag_pkts, overlap_segments, l2_bytes_1, l2_bytes_2 |
-| **Last non-null**  | rtt_ms (last observed per-tick median RTT in the emission window; null if no ACK samples in the entire window) |
+| **Last non-null**  | rtt_ms (last observed per-tick median RTT in the batch window; null if no ACK samples in the entire window) |
 | **Last-observed**  | dscp_1, dscp_2 (most recent value seen in the window, not a count) |
-| **Point-in-time**  | flow_age (age of the flow at the moment of emission)          |
+| **Point-in-time**  | flow_age (age of the flow at the last merged FLOW_TICK in the batch) |
 
 ### Identity echo
 
@@ -176,7 +196,7 @@ The exceptions are noted below.
 
 | Field    | Type         | Description                                             |
 |----------|--------------|---------------------------------------------------------|
-| `rtt_ms` | number\|null | Last observed per-tick median RTT within the emission window, in milliseconds. Computed from ACK timing. `null` when no RTT samples existed in any tick during the window (e.g. idle flow). |
+| `rtt_ms` | number\|null | Last observed per-tick median RTT within the batch window, in milliseconds. Computed from ACK timing. `null` when no RTT samples existed in any tick during the window (e.g. idle flow). |
 
 ### Retransmission
 
@@ -336,9 +356,10 @@ attribution is required.
 
 ### Computing rates
 
-Since most tick values are summed deltas over the emission window, rates are
-computed the same way as before — the `ts` gap between consecutive emissions
-is just wider (~10 s instead of sub-second):
+Since most tick values are summed deltas over the batch window, rates are
+computed from the `ts` gap between consecutive `flow_tick` records. In trigger
+4.0.0, `flow_tick.ts` is the time of the last merged FLOW_TICK data, not
+necessarily the time the batch was emitted by SESSION_EXPIRE:
 
 ```text
 interval_sec = (tick[N].ts - tick[N-1].ts) / 1000
